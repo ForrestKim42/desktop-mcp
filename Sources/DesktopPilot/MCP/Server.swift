@@ -305,7 +305,7 @@ public final class MCPServer: Sendable {
     public init(
         toolHandler: ToolHandler,
         serverName: String = "desktop-pilot-mcp",
-        serverVersion: String = "1.0.0"
+        serverVersion: String = "1.0.1"
     ) {
         self.toolHandler = toolHandler
         self.serverName = serverName
