@@ -1,0 +1,52 @@
+{
+  "name": "desktop-pilot-mcp",
+  "version": "1.0.0",
+  "description": "Universal macOS app automation for Claude — 30-100x faster than screenshot-based computer-use. Uses Accessibility API, AppleScript, and CGEvent.",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "claude",
+    "anthropic",
+    "macos",
+    "automation",
+    "accessibility",
+    "desktop-pilot",
+    "computer-use",
+    "ai",
+    "applescript",
+    "desktop-automation"
+  ],
+  "author": "VersoXBT",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/VersoXBT/desktop-pilot-mcp.git"
+  },
+  "homepage": "https://github.com/VersoXBT/desktop-pilot-mcp",
+  "bugs": {
+    "url": "https://github.com/VersoXBT/desktop-pilot-mcp/issues"
+  },
+  "os": [
+    "darwin"
+  ],
+  "bin": {
+    "desktop-pilot-mcp": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "Sources/",
+    "Tests/",
+    "Package.swift",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "swift build -c release 2>&1 || echo 'Build failed. Install Xcode Command Line Tools: xcode-select --install'",
+    "build": "swift build -c release",
+    "test": "swift test",
+    "start": "node bin/cli.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
