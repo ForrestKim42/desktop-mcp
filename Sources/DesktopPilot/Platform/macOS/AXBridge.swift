@@ -7,10 +7,10 @@ import Foundation
 /// Wraps an AXUIElement so it can cross concurrency boundaries.
 /// AXUIElement is a CFTypeRef (thread-safe by Apple's AX implementation)
 /// but Swift 6 does not know that, so we use @unchecked Sendable.
-final class AXElementWrapper: @unchecked Sendable {
-    let element: AXUIElement
+public final class AXElementWrapper: @unchecked Sendable {
+    public let element: AXUIElement
 
-    init(_ element: AXUIElement) {
+    public init(_ element: AXUIElement) {
         self.element = element
     }
 }
@@ -20,7 +20,9 @@ final class AXElementWrapper: @unchecked Sendable {
 /// Low-level wrapper around the macOS AXUIElement C API.
 /// Every public method is pure — no shared mutable state — so the
 /// type is safe to use from any isolation context.
-final class AXBridge: @unchecked Sendable {
+public final class AXBridge: @unchecked Sendable {
+
+    public init() {}
 
     // MARK: - Element Creation
 
@@ -217,12 +219,12 @@ final class AXBridge: @unchecked Sendable {
     // MARK: - Permissions
 
     /// Check if the current process is trusted for accessibility.
-    func isAccessibilityEnabled() -> Bool {
+    public func isAccessibilityEnabled() -> Bool {
         return AXIsProcessTrusted()
     }
 
     /// Prompt the user to grant accessibility access if not already trusted.
-    func promptForAccessibility() -> Bool {
+    public func promptForAccessibility() -> Bool {
         let key = "AXTrustedCheckOptionPrompt" as CFString
         let options = [key: true] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)

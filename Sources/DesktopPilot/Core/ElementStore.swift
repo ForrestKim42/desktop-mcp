@@ -12,15 +12,17 @@ import Foundation
 /// are wrapped in `AXElementWrapper` (@unchecked Sendable) before crossing
 /// the isolation boundary, since AXUIElement is thread-safe by Apple's
 /// implementation but Swift 6 does not know that.
-actor ElementStore {
+public actor ElementStore {
     private var elements: [String: AXElementWrapper] = [:]
     private var counter: Int = 0
+
+    public init() {}
 
     // MARK: - Lifecycle
 
     /// Reset the store before building a new snapshot.
     /// All previous refs become invalid after this call.
-    func reset() {
+    public func reset() {
         elements = [:]
         counter = 0
     }
@@ -39,7 +41,7 @@ actor ElementStore {
 
     /// Resolve a ref string back to its AXElementWrapper.
     /// Returns `nil` if the ref is unknown or the store has been reset.
-    func resolve(_ ref: String) -> AXElementWrapper? {
+    public func resolve(_ ref: String) -> AXElementWrapper? {
         return elements[ref]
     }
 
@@ -51,7 +53,7 @@ actor ElementStore {
     // MARK: - Diagnostics
 
     /// Current number of stored elements.
-    func count() -> Int {
+    public func count() -> Int {
         return elements.count
     }
 }

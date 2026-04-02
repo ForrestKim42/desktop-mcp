@@ -3,7 +3,7 @@ import Foundation
 // MARK: - JSON Value
 
 /// A flexible JSON value type for handling arbitrary MCP params.
-enum JSONValue: Codable, Sendable, Equatable {
+public enum JSONValue: Codable, Sendable, Equatable {
     case string(String)
     case number(Double)
     case bool(Bool)
@@ -11,7 +11,7 @@ enum JSONValue: Codable, Sendable, Equatable {
     case array([JSONValue])
     case object([String: JSONValue])
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
 
         if container.decodeNil() {
@@ -52,7 +52,7 @@ enum JSONValue: Codable, Sendable, Equatable {
         )
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
         case .string(let val):
@@ -71,7 +71,7 @@ enum JSONValue: Codable, Sendable, Equatable {
     }
 
     /// Extract a string value for the given key (object only).
-    func stringValue(forKey key: String) -> String? {
+    public func stringValue(forKey key: String) -> String? {
         guard case .object(let dict) = self,
               case .string(let val) = dict[key] else {
             return nil
@@ -80,7 +80,7 @@ enum JSONValue: Codable, Sendable, Equatable {
     }
 
     /// Extract an integer value for the given key (object only).
-    func intValue(forKey key: String) -> Int? {
+    public func intValue(forKey key: String) -> Int? {
         guard case .object(let dict) = self,
               case .number(let val) = dict[key] else {
             return nil
@@ -89,7 +89,7 @@ enum JSONValue: Codable, Sendable, Equatable {
     }
 
     /// Return the underlying dictionary if this is an object.
-    var objectValue: [String: JSONValue]? {
+    public var objectValue: [String: JSONValue]? {
         guard case .object(let dict) = self else { return nil }
         return dict
     }
@@ -189,31 +189,36 @@ struct JSONRPCError: Codable, Sendable {
 // MARK: - MCP Content Types
 
 /// A content block returned by a tool call.
-struct MCPContent: Codable, Sendable {
-    let type: String
-    let text: String?
-    let data: String?
-    let mimeType: String?
+public struct MCPContent: Codable, Sendable {
+    public let type: String
+    public let text: String?
+    public let data: String?
+    public let mimeType: String?
 
-    static func text(_ value: String) -> MCPContent {
+    public static func text(_ value: String) -> MCPContent {
         MCPContent(type: "text", text: value, data: nil, mimeType: nil)
     }
 
-    static func image(base64 data: String, mimeType: String) -> MCPContent {
+    public static func image(base64 data: String, mimeType: String) -> MCPContent {
         MCPContent(type: "image", text: nil, data: data, mimeType: mimeType)
     }
 }
 
 /// The result envelope for a tools/call response.
-struct MCPToolResult: Sendable {
-    let content: [MCPContent]
-    let isError: Bool
+public struct MCPToolResult: Sendable {
+    public let content: [MCPContent]
+    public let isError: Bool
 
-    static func success(_ text: String) -> MCPToolResult {
+    public init(content: [MCPContent], isError: Bool) {
+        self.content = content
+        self.isError = isError
+    }
+
+    public static func success(_ text: String) -> MCPToolResult {
         MCPToolResult(content: [.text(text)], isError: false)
     }
 
-    static func error(_ text: String) -> MCPToolResult {
+    public static func error(_ text: String) -> MCPToolResult {
         MCPToolResult(content: [.text(text)], isError: true)
     }
 
@@ -241,7 +246,7 @@ struct MCPToolResult: Sendable {
 // MARK: - Tool Handler Protocol
 
 /// Protocol for handling MCP tool calls.
-protocol ToolHandler: Sendable {
+public protocol ToolHandler: Sendable {
     /// Return all tool definitions for tools/list.
     func listTools() -> [ToolDefinition]
 
@@ -250,10 +255,10 @@ protocol ToolHandler: Sendable {
 }
 
 /// A tool definition with name, description, and JSON Schema for inputs.
-struct ToolDefinition: Sendable {
-    let name: String
-    let description: String
-    let inputSchema: JSONValue
+public struct ToolDefinition: Sendable {
+    public let name: String
+    public let description: String
+    public let inputSchema: JSONValue
 
     func toJSONValue() -> JSONValue {
         .object([
@@ -267,16 +272,16 @@ struct ToolDefinition: Sendable {
 // MARK: - Logger
 
 /// Logs messages to stderr so stdout stays clean for MCP protocol.
-enum Log {
-    static func info(_ message: String) {
+public enum Log {
+    public static func info(_ message: String) {
         write("[INFO] \(message)")
     }
 
-    static func error(_ message: String) {
+    public static func error(_ message: String) {
         write("[ERROR] \(message)")
     }
 
-    static func debug(_ message: String) {
+    public static func debug(_ message: String) {
         write("[DEBUG] \(message)")
     }
 
@@ -292,12 +297,12 @@ enum Log {
 
 /// MCP server that communicates over stdin/stdout using JSON-RPC with
 /// Content-Length framing.
-final class MCPServer: Sendable {
+public final class MCPServer: Sendable {
     private let toolHandler: ToolHandler
     private let serverName: String
     private let serverVersion: String
 
-    init(
+    public init(
         toolHandler: ToolHandler,
         serverName: String = "desktop-pilot-mcp",
         serverVersion: String = "0.1.0"
@@ -308,7 +313,7 @@ final class MCPServer: Sendable {
     }
 
     /// Start the server and process messages from stdin until EOF.
-    func run() async {
+    public func run() async {
         Log.info("Starting \(serverName) v\(serverVersion)")
 
         let stdin = FileHandle.standardInput

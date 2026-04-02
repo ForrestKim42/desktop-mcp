@@ -4,7 +4,7 @@ import Foundation
 // MARK: - Interaction Method
 
 /// The layer used to interact with a macOS application.
-enum InteractionMethod: Sendable {
+enum InteractionMethod: Sendable, Equatable {
     case accessibility
     case applescript
     case cgevent
@@ -14,7 +14,7 @@ enum InteractionMethod: Sendable {
 // MARK: - App Category
 
 /// Classification of an app based on its technology stack and scripting support.
-enum AppCategory: Sendable {
+enum AppCategory: Sendable, Equatable {
     /// Has an AppleScript dictionary (scriptable via `sdef`).
     case scriptable
     /// Chromium-based (Electron). Limited Accessibility support, no AppleScript.
