@@ -3,14 +3,13 @@ import DesktopPilot
 let bridge = AXBridge()
 let store = ElementStore()
 
-// Check accessibility permissions on startup
+// Log accessibility status but never prompt (prompting blocks when spawned by MCP clients)
 if !bridge.isAccessibilityEnabled() {
-    Log.error(
-        "Accessibility permission not granted. "
-        + "Go to System Settings > Privacy & Security > Accessibility "
-        + "and add this application."
+    Log.info(
+        "Accessibility permission not yet granted. "
+        + "Tools will return errors until permission is granted. "
+        + "Go to System Settings > Privacy & Security > Accessibility."
     )
-    _ = bridge.promptForAccessibility()
 }
 
 let toolHandler = PilotToolHandler(bridge: bridge, store: store)
