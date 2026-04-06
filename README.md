@@ -1,20 +1,10 @@
-<div align="center">
-
-[![Stars](https://img.shields.io/github/stars/VersoXBT/desktop-pilot-mcp?style=flat-square&logo=github&label=Stars)](https://github.com/VersoXBT/desktop-pilot-mcp)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![Swift](https://img.shields.io/badge/Swift-5.9+-orange?style=flat-square&logo=swift)](https://swift.org)
-[![MCP Server](https://img.shields.io/badge/MCP-Server-blueviolet?style=flat-square)]()
-[![macOS](https://img.shields.io/badge/macOS-native-black?style=flat-square&logo=apple)]()
-[![Speed](https://img.shields.io/badge/Speed-30--100x%20faster-brightgreen?style=flat-square)]()
-
-</div>
-
 <p align="center">
   <h1 align="center">Desktop Pilot MCP</h1>
   <p align="center">Native macOS automation for Claude. 30-100x faster than screenshots.</p>
 </p>
 
 <p align="center">
+  <a href="https://github.com/VersoXBT/desktop-pilot-mcp"><img alt="Stars" src="https://img.shields.io/github/stars/VersoXBT/desktop-pilot-mcp?style=flat&logo=github&label=Stars" /></a>
   <a href="#"><img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue.svg" /></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green.svg" /></a>
   <a href="#"><img alt="Platform" src="https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey.svg" /></a>
