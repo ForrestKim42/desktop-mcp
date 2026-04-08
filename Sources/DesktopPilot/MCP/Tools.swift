@@ -1,77 +1,82 @@
+import AppKit
 import ApplicationServices
+import CoreGraphics
 import Foundation
 
 // MARK: - Tool Registry
 
-/// Registers all Desktop Pilot tools and dispatches calls to real implementations.
+/// Registers the unified `desktop_do` tool and dispatches all actions.
 public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
 
     private let bridge: AXBridge
     private let store: ElementStore
     private let registry: AppRegistry
     private let snapshotBuilder: SnapshotBuilder
+    private let cdpSnapshotBuilder: CDPSnapshotBuilder
     private let screenshotLayer: ScreenshotLayer
+    private let cgEventLayer: CGEventLayer
+
+    /// Active CDP connections keyed by app name.
+    private var cdpConnections: [String: CDPBridge] = [:]
 
     public init(bridge: AXBridge, store: ElementStore) {
         self.bridge = bridge
         self.store = store
         self.registry = AppRegistry()
         self.snapshotBuilder = SnapshotBuilder(bridge: bridge)
+        self.cdpSnapshotBuilder = CDPSnapshotBuilder()
         self.screenshotLayer = ScreenshotLayer(bridge: bridge, store: store)
+        self.cgEventLayer = CGEventLayer(bridge: bridge, store: store)
     }
 
     public func listTools() -> [ToolDefinition] {
-        [
-            snapshotTool,
-            clickTool,
-            typeTool,
-            readTool,
-            findTool,
-            listAppsTool,
-            menuTool,
-            scriptTool,
-            screenshotTool,
-            batchTool,
-        ]
+        [desktopDoTool]
     }
 
     public func callTool(name: String, arguments: JSONValue?) async throws -> MCPToolResult {
         switch name {
-        case "pilot_snapshot":
-            return await handleSnapshot(arguments)
-        case "pilot_click":
-            return await handleClick(arguments)
-        case "pilot_type":
-            return await handleType(arguments)
-        case "pilot_read":
-            return await handleRead(arguments)
-        case "pilot_find":
-            return await handleFind(arguments)
-        case "pilot_list_apps":
-            return await handleListApps(arguments)
-        case "pilot_menu":
-            return await handleMenu(arguments)
-        case "pilot_script":
-            return await handleScript(arguments)
-        case "pilot_screenshot":
-            return await handleScreenshot(arguments)
-        case "pilot_batch":
-            return await handleBatch(arguments)
+        case "desktop_do":
+            return await handleDesktopDo(arguments)
         default:
             return .error("Unknown tool: \(name)")
         }
     }
 
-    // MARK: - Tool Definitions
+    // MARK: - Tool Definition
 
-    private var snapshotTool: ToolDefinition {
+    private var desktopDoTool: ToolDefinition {
         ToolDefinition(
-            name: "pilot_snapshot",
+            name: "desktop_do",
             description: """
-                Get a structured snapshot of an app's UI element tree via the Accessibility API. \
-                Use this as the FIRST step when interacting with any macOS app -- it returns every \
-                visible element with a ref ID you can pass to other tools. Much faster and more \
-                reliable than screenshots.
+                Control any macOS app via accessibility. Call without actions to read the screen. \
+                Call with actions to execute them and get the updated screen state.
+
+                Element IDs use App/TYPE:Label format (e.g. Arc/BUTTON:Save, Finder/IMAGE:data). \
+                Duplicates get @N suffix (Arc/BUTTON:OK@1, Arc/BUTTON:OK@2). \
+                You can omit the app prefix to target the default app.
+
+                Cross-app batching: each action can target a different app by including the app prefix. \
+                Example: ["tap Arc/BUTTON:New Tab", "tap Finder/IMAGE:data"]
+
+                Actions (string or JSON array of strings):
+                  tap Arc/BUTTON:Save      — click element (app prefix optional)
+                  type hello world         — type text into focused element
+                  type Arc/INPUT:URL test  — type into specific element in specific app
+                  press RETURN             — press key (RETURN, TAB, ESCAPE, DELETE, SPACE, arrows)
+                  press CMD+A              — hotkey combo (CMD/SHIFT/ALT/CTRL + key)
+                  wait 2000                — pause N milliseconds
+                  screenshot               — capture full screen (returns base64)
+                  screenshot /path.png     — capture to file
+                  scroll down 3            — scroll direction + pixel amount
+                  menu File > Save         — activate menu item
+                  apps                     — list running applications
+
+                Examples:
+                  desktop_do()                                     — read frontmost app
+                  desktop_do(app: "Arc")                           — read Arc's screen
+                  desktop_do(actions: "tap BUTTON:Save")           — single action on frontmost
+                  desktop_do(actions: ["tap Arc/INPUT:URL", "type https://example.com", "press RETURN"])
+                  desktop_do(actions: ["tap Arc/BUTTON:Copy", "tap 메모/BUTTON:붙여넣기"])  — cross-app
                 """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -79,280 +84,426 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                     "app": .object([
                         "type": .string("string"),
                         "description": .string(
-                            "App name or bundle ID. Omit for frontmost app."
+                            "Default app name or bundle ID. Omit for frontmost app. "
+                            + "Individual actions can override with App/TYPE:Label prefix."
                         ),
                     ]),
-                    "maxDepth": .object([
-                        "type": .string("integer"),
-                        "description": .string(
-                            "Maximum tree depth to traverse (default 10)."
-                        ),
-                    ]),
-                ]),
-                "required": .array([]),
-            ])
-        )
-    }
-
-    private var clickTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_click",
-            description: """
-                Click a UI element by its ref ID. Use after pilot_snapshot to interact with \
-                buttons, checkboxes, menu items, and other clickable elements.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "ref": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Element reference ID from a snapshot (e.g., \"e1\")."
-                        ),
-                    ]),
-                ]),
-                "required": .array([.string("ref")]),
-            ])
-        )
-    }
-
-    private var typeTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_type",
-            description: """
-                Type text into a UI element (text field, search box, etc.) by its ref ID. \
-                Focuses the element first, then inserts the text.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "ref": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Element reference ID from a snapshot."
-                        ),
-                    ]),
-                    "text": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Text to type into the element."
-                        ),
-                    ]),
-                ]),
-                "required": .array([.string("ref"), .string("text")]),
-            ])
-        )
-    }
-
-    private var readTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_read",
-            description: """
-                Read the current value/content of a UI element by its ref ID. Use to get text \
-                field contents, label text, checkbox state, or any element's value attribute.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "ref": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Element reference ID from a snapshot."
-                        ),
-                    ]),
-                ]),
-                "required": .array([.string("ref")]),
-            ])
-        )
-    }
-
-    private var findTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_find",
-            description: """
-                Search for UI elements matching criteria (role, title, value) across one or \
-                all apps. Faster than taking a full snapshot when you know what you're looking for.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "role": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "AX role to match (e.g., \"AXButton\", \"AXTextField\")."
-                        ),
-                    ]),
-                    "title": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Title/label substring to match (case-insensitive)."
-                        ),
-                    ]),
-                    "value": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Value substring to match."
-                        ),
-                    ]),
-                    "app": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Limit search to this app name or bundle ID."
-                        ),
-                    ]),
-                ]),
-                "required": .array([]),
-            ])
-        )
-    }
-
-    private var listAppsTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_list_apps",
-            description: """
-                List all running applications with their names, bundle IDs, PIDs, and window \
-                counts. Use to discover what apps are available before taking a snapshot.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([:]),
-                "required": .array([]),
-            ])
-        )
-    }
-
-    private var menuTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_menu",
-            description: """
-                Activate a menu bar item by its path (e.g., \"File > Save As...\"). Works by \
-                traversing the app's menu bar hierarchy.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "path": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Menu path using \" > \" separator (e.g., \"File > Save As...\")."
-                        ),
-                    ]),
-                    "app": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "App name or bundle ID. Omit for frontmost app."
-                        ),
-                    ]),
-                ]),
-                "required": .array([.string("path")]),
-            ])
-        )
-    }
-
-    private var scriptTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_script",
-            description: """
-                Run an AppleScript or JXA script. The code runs globally with user-level \
-                privileges via osascript. Use for operations that are easier to express in \
-                script form than through individual UI actions. The script has a 30-second timeout.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "code": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "AppleScript or JXA code to execute."
-                        ),
-                    ]),
-                    "language": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Script language: \"applescript\" (default) or \"jxa\"."
-                        ),
-                        "enum": .array([
-                            .string("applescript"),
-                            .string("jxa"),
-                        ]),
-                    ]),
-                ]),
-                "required": .array([.string("code")]),
-            ])
-        )
-    }
-
-    private var screenshotTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_screenshot",
-            description: """
-                Capture a screenshot of a specific element or the full screen. Returns a \
-                base64-encoded PNG. Use sparingly -- pilot_snapshot is usually better for \
-                understanding UI state.
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "ref": .object([
-                        "type": .string("string"),
-                        "description": .string(
-                            "Element ref to screenshot. Omit for full screen."
-                        ),
-                    ]),
-                ]),
-                "required": .array([]),
-            ])
-        )
-    }
-
-    private var batchTool: ToolDefinition {
-        ToolDefinition(
-            name: "pilot_batch",
-            description: """
-                Execute multiple tool calls in sequence. Reduces round-trips when you need \
-                to perform several actions in a row (e.g., click a field, type text, click \
-                a button).
-                """,
-            inputSchema: .object([
-                "type": .string("object"),
-                "properties": .object([
                     "actions": .object([
-                        "type": .string("array"),
                         "description": .string(
-                            "Array of actions to execute in order."
+                            "Action string or JSON array of action strings. Omit to just read the screen."
                         ),
-                        "items": .object([
-                            "type": .string("object"),
-                            "properties": .object([
-                                "tool": .object([
-                                    "type": .string("string"),
-                                    "description": .string(
-                                        "Tool name (e.g., \"pilot_click\")."
-                                    ),
-                                ]),
-                                "params": .object([
-                                    "type": .string("object"),
-                                    "description": .string(
-                                        "Tool parameters as key-value pairs."
-                                    ),
-                                    "additionalProperties": .object([
-                                        "type": .string("string"),
-                                    ]),
-                                ]),
-                            ]),
-                            "required": .array([
-                                .string("tool"),
-                                .string("params"),
+                        "oneOf": .array([
+                            .object(["type": .string("string")]),
+                            .object([
+                                "type": .string("array"),
+                                "items": .object(["type": .string("string")])
                             ]),
                         ]),
                     ]),
                 ]),
-                "required": .array([.string("actions")]),
+                "required": .array([]),
             ])
         )
     }
 
-    // MARK: - Real Handlers
+    // MARK: - Main Handler
+
+    private func handleDesktopDo(_ arguments: JSONValue?) async -> MCPToolResult {
+        guard bridge.isAccessibilityEnabled() else {
+            return .error(
+                "Accessibility permission not granted. "
+                + "Go to System Settings > Privacy & Security > Accessibility "
+                + "and add this application."
+            )
+        }
+
+        let appName = arguments?.stringValue(forKey: "app")
+        let actionsInput: JSONValue? = {
+            guard case .object(let dict) = arguments else { return nil }
+            return dict["actions"]
+        }()
+
+        guard let defaultApp = resolveApp(appName) else {
+            return .error("Could not find app: \(appName ?? "frontmost"). Is it running?")
+        }
+
+        // Take initial snapshot of default app
+        await takeSnapshot(app: defaultApp)
+
+        // If no actions, just return the screen state
+        guard let actionStrings = ActionParser.parseActions(actionsInput), !actionStrings.isEmpty else {
+            let screenText = await formatScreen(app: defaultApp)
+            return .success(screenText)
+        }
+
+        // Execute actions sequentially
+        var output: [String] = []
+        var currentDefaultApp = defaultApp
+
+        for actionStr in actionStrings {
+            guard let action = ActionParser.parse(actionStr) else {
+                output.append("> \(actionStr)\n  ERROR: unrecognized action")
+                continue
+            }
+
+            let result = await executeAction(
+                action,
+                rawString: actionStr,
+                defaultApp: &currentDefaultApp
+            )
+            output.append(result)
+        }
+
+        // Take final snapshot and append screen state
+        await takeSnapshot(app: currentDefaultApp)
+        let screenState = await formatScreen(app: currentDefaultApp)
+
+        output.append("---")
+        output.append(screenState)
+
+        return .success(output.joined(separator: "\n"))
+    }
+
+    // MARK: - Action Execution
+
+    private func executeAction(
+        _ action: ParsedAction,
+        rawString: String,
+        defaultApp: inout (name: String, pid: Int32)
+    ) async -> String {
+        switch action {
+        case .tap(let target):
+            return await executeTap(target: target, defaultApp: &defaultApp)
+
+        case .type(let text):
+            return await executeType(text: text, defaultApp: &defaultApp)
+
+        case .press(let key):
+            return executePress(key: key)
+
+        case .wait(let ms):
+            try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+            return "> wait \(ms)"
+
+        case .screenshot(let path):
+            return executeScreenshot(path: path)
+
+        case .scroll(let direction, let amount):
+            return executeScroll(direction: direction, amount: amount)
+
+        case .menu(let path):
+            return await executeMenu(path: path, app: defaultApp)
+
+        case .listApps:
+            return executeListApps()
+        }
+    }
+
+    /// Resolve the target app from an element ref like "Arc/BUTTON:Save".
+    /// If the ref has an app prefix, switch to that app and snapshot it if needed.
+    /// Returns the resolved (app, elementRef) tuple.
+    private func resolveTargetApp(
+        from target: String,
+        defaultApp: inout (name: String, pid: Int32)
+    ) async -> (app: (name: String, pid: Int32), elementRef: String)? {
+        // Check if target has an app prefix
+        if let appName = ElementStore.extractApp(from: target) {
+            let elementRef = ElementStore.stripApp(from: target)
+
+            // If this is a different app, resolve and snapshot it
+            if let app = resolveApp(appName) {
+                if !(await store.isSnapshotted(app.name)) {
+                    await takeSnapshot(app: app)
+                }
+                return (app, elementRef)
+            } else {
+                return nil // App not found
+            }
+        }
+
+        // No app prefix — use default app
+        return (defaultApp, target)
+    }
+
+    private func executeTap(
+        target: String,
+        defaultApp: inout (name: String, pid: Int32)
+    ) async -> String {
+        guard let resolved = await resolveTargetApp(from: target, defaultApp: &defaultApp) else {
+            return "> tap \(target)\n  ERROR: app not found"
+        }
+
+        guard let wrapper = await store.resolve(target, defaultApp: resolved.app.name) else {
+            return "> tap \(target)\n  ERROR: element not found"
+        }
+
+        // Activate the target app first
+        activateApp(pid: resolved.app.pid)
+
+        // Check if this is a CDP element (DOM index based)
+        let fullRef = target.contains("/") ? target : "\(resolved.app.name)/\(resolved.elementRef)"
+        if let domIndex = await CDPElementHolder.shared.resolve(ref: fullRef),
+           domIndex >= 0,
+           let cdp = cdpConnections[resolved.app.name] {
+            do {
+                let script = CDPSnapshotBuilder.clickScript(index: domIndex)
+                let result = try await cdp.sendCommand("Runtime.evaluate", params: [
+                    "expression": script,
+                    "returnByValue": true
+                ])
+                if let res = result["result"] as? [String: Any],
+                   let val = res["value"] as? String,
+                   val.contains("\"ok\":true") {
+                    return "> tapped \(target) (CDP)"
+                }
+                return "> tap \(target)\n  ERROR: CDP click returned unexpected result"
+            } catch {
+                return "> tap \(target)\n  ERROR: CDP click failed: \(error)"
+            }
+        }
+
+        // AXPress (semantic click)
+        let success = bridge.performAction(wrapper.element, kAXPressAction)
+        if success {
+            return "> tapped \(target)"
+        }
+
+        // Fallback: CGEvent coordinate click
+        if let bounds = bridge.getBounds(wrapper.element) {
+            cgEventLayer.clickElement(bounds: bounds)
+            return "> tapped \(target) (via coordinates)"
+        }
+
+        return "> tap \(target)\n  ERROR: click failed"
+    }
+
+    private func executeType(
+        text: String,
+        defaultApp: inout (name: String, pid: Int32)
+    ) async -> String {
+        // Try to split "ref actualText" — ref may contain spaces (e.g. "Slack/INPUT:김선태(Forrest Kim) hello")
+        // Strategy: try matching against known refs in the store, longest match first
+        if let (possibleRef, actualText) = await splitRefAndText(text, defaultApp: defaultApp) {
+            if let resolved = await resolveTargetApp(from: possibleRef, defaultApp: &defaultApp) {
+                activateApp(pid: resolved.app.pid)
+
+                // Check CDP path first
+                let fullRef = possibleRef.contains("/") ? possibleRef : "\(resolved.app.name)/\(possibleRef)"
+                if let domIndex = await CDPElementHolder.shared.resolve(ref: fullRef),
+                   domIndex >= 0,
+                   let cdp = cdpConnections[resolved.app.name] {
+                    do {
+                        let setScript = CDPSnapshotBuilder.setValueScript(index: domIndex, value: actualText)
+                        let setResult = try await cdp.sendCommand("Runtime.evaluate", params: [
+                            "expression": setScript,
+                            "returnByValue": true
+                        ])
+
+                        if let res = setResult["result"] as? [String: Any],
+                           let val = res["value"] as? String,
+                           val.contains("\"contenteditable\":true") {
+                            _ = try await cdp.sendCommand("Input.insertText", params: [
+                                "text": actualText
+                            ])
+                        }
+
+                        return "> typed \"\(actualText)\" into \(possibleRef) (CDP)"
+                    } catch {
+                        return "> type \(possibleRef)\n  ERROR: CDP type failed: \(error)"
+                    }
+                }
+
+                // AX path
+                if let wrapper = await store.resolve(possibleRef, defaultApp: resolved.app.name) {
+                    _ = bridge.setAttribute(wrapper.element, kAXFocusedAttribute, true as CFTypeRef)
+
+                    let success = bridge.setAttribute(
+                        wrapper.element, kAXValueAttribute, actualText as CFTypeRef
+                    )
+                    if success {
+                        return "> typed \"\(actualText)\" into \(possibleRef)"
+                    }
+
+                    cgEventLayer.typeString(actualText)
+                    return "> typed \"\(actualText)\" into \(possibleRef) (via keyboard)"
+                }
+            }
+        }
+
+        // Plain text — type into whatever is focused
+        cgEventLayer.typeString(text)
+        return "> typed \"\(text)\""
+    }
+
+    private func executePress(key: String) -> String {
+        guard let resolved = ActionParser.resolveKey(key) else {
+            return "> press \(key)\n  ERROR: unknown key"
+        }
+
+        let source = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: resolved.keyCode, keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: resolved.keyCode, keyDown: false)
+
+        let flags = CGEventFlags(rawValue: resolved.flags)
+        keyDown?.flags = flags
+        keyUp?.flags = flags
+
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
+
+        return "> pressed \(key)"
+    }
+
+    private func executeScreenshot(path: String?) -> String {
+        guard let data = screenshotLayer.captureFullScreen() else {
+            return "> screenshot\n  ERROR: capture failed (check Screen Recording permission)"
+        }
+
+        if let path {
+            let url = URL(fileURLWithPath: path)
+            do {
+                try data.write(to: url)
+                return "> screenshot saved to \(path)"
+            } catch {
+                return "> screenshot\n  ERROR: failed to save to \(path): \(error)"
+            }
+        }
+
+        let base64 = data.base64EncodedString()
+        let preview = String(base64.prefix(100))
+        return "> screenshot captured (\(data.count) bytes, base64: \(preview)...)"
+    }
+
+    private func executeScroll(direction: String, amount: Int) -> String {
+        let (deltaY, deltaX): (Int32, Int32) = {
+            switch direction.lowercased() {
+            case "up":    return (Int32(amount), 0)
+            case "down":  return (Int32(-amount), 0)
+            case "left":  return (0, Int32(amount))
+            case "right": return (0, Int32(-amount))
+            default:      return (Int32(-amount), 0)
+            }
+        }()
+
+        cgEventLayer.scroll(deltaY: deltaY, deltaX: deltaX)
+        return "> scrolled \(direction) \(amount)"
+    }
+
+    private func executeMenu(path: String, app: (name: String, pid: Int32)) async -> String {
+        let pathComponents = path
+            .components(separatedBy: " > ")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+
+        activateApp(pid: app.pid)
+        let appElement = bridge.appElement(pid: app.pid)
+        let success = bridge.navigateMenu(appElement, path: pathComponents)
+
+        if success {
+            return "> menu \(path)"
+        }
+        return "> menu \(path)\n  ERROR: menu item not found"
+    }
+
+    private func executeListApps() -> String {
+        var apps = registry.listApps()
+        if bridge.isAccessibilityEnabled() {
+            apps = apps.map { registry.enrichWithWindowCount($0, bridge: bridge) }
+        }
+
+        var lines = ["> Running apps:"]
+        for app in apps {
+            let bid = app.bundleID ?? "?"
+            lines.append("  \(app.name) (\(bid)) pid=\(app.pid) windows=\(app.windowCount)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Snapshot & Formatting
+
+    @discardableResult
+    private func takeSnapshot(app: (name: String, pid: Int32)) async -> AppSnapshot {
+        let appInfo = registry.findApp(pid: app.pid)
+        let bundleID = appInfo?.bundleID
+
+        // Check if this is an Electron app with CDP available
+        if CDPBridge.isElectronApp(bundleID: bundleID, pid: app.pid) {
+            if let cdp = cdpConnections[app.name] {
+                // Already connected — use CDP
+                return await takeCDPSnapshot(cdp: cdp, app: app, bundleID: bundleID)
+            }
+
+            // Try to find and connect to CDP
+            if let port = await CDPBridge.findCDPPort(for: bundleID) {
+                let cdp = CDPBridge(port: port)
+                do {
+                    try await cdp.connect()
+                    cdpConnections[app.name] = cdp
+                    Log.info("CDP connected to \(app.name) on port \(port)")
+                    return await takeCDPSnapshot(cdp: cdp, app: app, bundleID: bundleID)
+                } catch {
+                    Log.info("CDP connection failed for \(app.name): \(error). Falling back to AX.")
+                }
+            }
+        }
+
+        // Default: macOS AX API
+        let appElement = bridge.appElement(pid: app.pid)
+        return await snapshotBuilder.buildSnapshot(
+            appElement: appElement,
+            appName: app.name,
+            bundleID: bundleID,
+            pid: app.pid,
+            store: store,
+            maxDepth: 100
+        )
+    }
+
+    private func takeCDPSnapshot(
+        cdp: CDPBridge,
+        app: (name: String, pid: Int32),
+        bundleID: String?
+    ) async -> AppSnapshot {
+        do {
+            return try await cdpSnapshotBuilder.buildSnapshot(
+                cdp: cdp,
+                appName: app.name,
+                bundleID: bundleID,
+                pid: app.pid,
+                store: store
+            )
+        } catch {
+            Log.error("CDP DOM snapshot failed: \(error). Falling back to AX.")
+            let appElement = bridge.appElement(pid: app.pid)
+            return await snapshotBuilder.buildSnapshot(
+                appElement: appElement,
+                appName: app.name,
+                bundleID: bundleID,
+                pid: app.pid,
+                store: store,
+                maxDepth: 100
+            )
+        }
+    }
+
+    /// Format the current screen state as a flat element list.
+    private func formatScreen(app: (name: String, pid: Int32)) async -> String {
+        let refs = await store.refsForApp(app.name)
+
+        if refs.isEmpty {
+            return "[\(app.name)] No accessible elements found."
+        }
+
+        // Build tree from refs by re-reading the snapshot structure
+        // For simplicity, just list all refs in order
+        var lines = ["[\(app.name)] \(refs.count) elements:"]
+        for ref in refs {
+            lines.append("  \(ref)")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - App Resolution & Activation
 
     private func resolveApp(_ appName: String?) -> (name: String, pid: Int32)? {
         if let appName = appName {
@@ -367,441 +518,52 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         return nil
     }
 
-    private func handleSnapshot(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard bridge.isAccessibilityEnabled() else {
-            return .error(
-                "Accessibility permission not granted. "
-                + "Go to System Settings > Privacy & Security > Accessibility "
-                + "and add this application."
-            )
-        }
-
-        let appName = arguments?.stringValue(forKey: "app")
-        let rawDepth = arguments?.intValue(forKey: "maxDepth") ?? 10
-        let maxDepth = max(1, min(rawDepth, 50))
-
-        guard let app = resolveApp(appName) else {
-            return .error("Could not find app: \(appName ?? "frontmost"). Is it running?")
-        }
-
-        let appElement = bridge.appElement(pid: app.pid)
-        let appInfo = registry.findApp(pid: app.pid)
-
-        let snapshot = await snapshotBuilder.buildSnapshot(
-            appElement: appElement,
-            appName: app.name,
-            bundleID: appInfo?.bundleID,
-            pid: app.pid,
-            store: store,
-            maxDepth: maxDepth
-        )
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
-        do {
-            let data = try encoder.encode(snapshot)
-            let json = String(data: data, encoding: .utf8) ?? "{}"
-            return .success(json)
-        } catch {
-            return .error("Failed to encode snapshot: \(error)")
-        }
+    /// Bring an app to the foreground.
+    private func activateApp(pid: Int32) {
+        let app = NSRunningApplication(processIdentifier: pid)
+        app?.activate()
     }
 
-    private func handleClick(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard let ref = arguments?.stringValue(forKey: "ref") else {
-            return .error("Missing required parameter: ref")
+    /// Split "ref text" where ref may contain spaces.
+    /// Matches against known refs in the store to find the boundary.
+    private func splitRefAndText(
+        _ input: String,
+        defaultApp: (name: String, pid: Int32)
+    ) async -> (ref: String, text: String)? {
+        // Must contain ":" to be a ref
+        guard input.contains(":") else { return nil }
+
+        let allRefs = await store.allRefs()
+
+        // Try matching against known refs (longest match wins)
+        for ref in allRefs {
+            if input.hasPrefix(ref + " ") {
+                let textStart = input.index(input.startIndex, offsetBy: ref.count + 1)
+                return (ref, String(input[textStart...]))
+            }
         }
 
-        guard let wrapper = await store.resolve(ref) else {
-            return .error("Unknown ref '\(ref)'. Take a new snapshot first.")
-        }
-
-        let success = bridge.performAction(wrapper.element, kAXPressAction)
-        if success {
-            return .success("Clicked element \(ref)")
-        } else {
-            return .error("Failed to click element \(ref). It may not be clickable.")
-        }
-    }
-
-    private func handleType(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard let ref = arguments?.stringValue(forKey: "ref"),
-              let text = arguments?.stringValue(forKey: "text") else {
-            return .error("Missing required parameters: ref, text")
-        }
-
-        guard let wrapper = await store.resolve(ref) else {
-            return .error("Unknown ref '\(ref)'. Take a new snapshot first.")
-        }
-
-        // Focus the element first
-        _ = bridge.setAttribute(
-            wrapper.element,
-            kAXFocusedAttribute,
-            true as CFTypeRef
-        )
-
-        // Try to set value directly
-        let success = bridge.setAttribute(
-            wrapper.element,
-            kAXValueAttribute,
-            text as CFTypeRef
-        )
-
-        if success {
-            return .success("Typed \"\(text)\" into element \(ref)")
-        } else {
-            return .error(
-                "Failed to type into element \(ref). "
-                + "It may not be a text input field."
-            )
-        }
-    }
-
-    private func handleRead(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard let ref = arguments?.stringValue(forKey: "ref") else {
-            return .error("Missing required parameter: ref")
-        }
-
-        guard let wrapper = await store.resolve(ref) else {
-            return .error("Unknown ref '\(ref)'. Take a new snapshot first.")
-        }
-
-        let value = bridge.getValue(wrapper.element)
-        let title = bridge.getTitle(wrapper.element)
-        let role = bridge.getRole(wrapper.element)
-        let description = bridge.getDescription(wrapper.element)
-
-        var parts: [String] = []
-        if let role = role { parts.append("role: \(role)") }
-        if let title = title { parts.append("title: \(title)") }
-        if let value = value { parts.append("value: \(value)") }
-        if let description = description { parts.append("description: \(description)") }
-
-        if parts.isEmpty {
-            return .success("Element \(ref) has no readable attributes.")
-        }
-        return .success(parts.joined(separator: "\n"))
-    }
-
-    private func handleFind(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard bridge.isAccessibilityEnabled() else {
-            return .error("Accessibility permission not granted.")
-        }
-
-        let roleFilter = arguments?.stringValue(forKey: "role")
-        let titleFilter = arguments?.stringValue(forKey: "title")
-        let valueFilter = arguments?.stringValue(forKey: "value")
-        let appName = arguments?.stringValue(forKey: "app")
-
-        guard let app = resolveApp(appName) else {
-            return .error("Could not find app: \(appName ?? "frontmost")")
-        }
-
-        let appElement = bridge.appElement(pid: app.pid)
-        let appInfo = registry.findApp(pid: app.pid)
-
-        // Build a snapshot to search through
-        let snapshot = await snapshotBuilder.buildSnapshot(
-            appElement: appElement,
-            appName: app.name,
-            bundleID: appInfo?.bundleID,
-            pid: app.pid,
-            store: store,
-            maxDepth: 10
-        )
-
-        // Flatten and filter
-        var matches: [PilotElement] = []
-        flattenAndFilter(
-            elements: snapshot.elements,
-            role: roleFilter,
-            title: titleFilter,
-            value: valueFilter,
-            into: &matches,
-            limit: 50
-        )
-
-        if matches.isEmpty {
-            return .success("No elements found matching the criteria.")
-        }
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
-        do {
-            let data = try encoder.encode(matches)
-            let json = String(data: data, encoding: .utf8) ?? "[]"
-            return .success(json)
-        } catch {
-            return .error("Failed to encode results: \(error)")
-        }
-    }
-
-    private func flattenAndFilter(
-        elements: [PilotElement],
-        role: String?,
-        title: String?,
-        value: String?,
-        into matches: inout [PilotElement],
-        limit: Int
-    ) {
-        for element in elements {
-            guard matches.count < limit else { return }
-
-            var isMatch = true
-
-            if let role = role {
-                let elementRole = element.role.lowercased()
-                let searchRole = role.lowercased()
-                if !elementRole.contains(searchRole) {
-                    isMatch = false
+        // Try without app prefix: match "TYPE:Label text" against store
+        let defaultPrefix = defaultApp.name + "/"
+        for ref in allRefs {
+            if ref.hasPrefix(defaultPrefix) {
+                let shortRef = String(ref.dropFirst(defaultPrefix.count))
+                if input.hasPrefix(shortRef + " ") {
+                    let textStart = input.index(input.startIndex, offsetBy: shortRef.count + 1)
+                    return (shortRef, String(input[textStart...]))
                 }
             }
-
-            if let title = title, isMatch {
-                let elementTitle = (element.title ?? "").lowercased()
-                if !elementTitle.contains(title.lowercased()) {
-                    isMatch = false
-                }
-            }
-
-            if let value = value, isMatch {
-                let elementValue = (element.value ?? "").lowercased()
-                if !elementValue.contains(value.lowercased()) {
-                    isMatch = false
-                }
-            }
-
-            if isMatch {
-                // Return without children to keep output compact
-                matches.append(PilotElement(
-                    ref: element.ref,
-                    role: element.role,
-                    title: element.title,
-                    value: element.value,
-                    description: element.description,
-                    enabled: element.enabled,
-                    focused: element.focused,
-                    bounds: element.bounds,
-                    children: nil
-                ))
-            }
-
-            if let children = element.children {
-                flattenAndFilter(
-                    elements: children,
-                    role: role,
-                    title: title,
-                    value: value,
-                    into: &matches,
-                    limit: limit
-                )
-            }
-        }
-    }
-
-    private func handleListApps(_ arguments: JSONValue?) async -> MCPToolResult {
-        var apps = registry.listApps()
-
-        // Enrich with window counts if accessibility is enabled
-        if bridge.isAccessibilityEnabled() {
-            apps = apps.map { registry.enrichWithWindowCount($0, bridge: bridge) }
         }
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
-        do {
-            let data = try encoder.encode(apps)
-            let json = String(data: data, encoding: .utf8) ?? "[]"
-            return .success(json)
-        } catch {
-            return .error("Failed to encode app list: \(error)")
-        }
-    }
-
-    private func handleMenu(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard let pathStr = arguments?.stringValue(forKey: "path") else {
-            return .error("Missing required parameter: path")
-        }
-
-        let appName = arguments?.stringValue(forKey: "app")
-        guard let app = resolveApp(appName) else {
-            return .error("Could not find app: \(appName ?? "frontmost")")
-        }
-
-        let pathComponents = pathStr
-            .components(separatedBy: " > ")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-
-        guard !pathComponents.isEmpty else {
-            return .error("Invalid menu path: \(pathStr)")
-        }
-
-        let appElement = bridge.appElement(pid: app.pid)
-        let success = bridge.navigateMenu(appElement, path: pathComponents)
-
-        if success {
-            return .success("Activated menu: \(pathStr)")
-        } else {
-            return .error(
-                "Failed to navigate menu path: \(pathStr). "
-                + "Check that the menu items exist in \(app.name)."
-            )
-        }
-    }
-
-    private static let scriptTimeoutSeconds: Double = 30
-
-    private func handleScript(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard let code = arguments?.stringValue(forKey: "code") else {
-            return .error("Missing required parameter: code")
-        }
-
-        let language = arguments?.stringValue(forKey: "language") ?? "applescript"
-
-        let process = Process()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-
-        if language == "jxa" {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-l", "JavaScript", "-e", code]
-        } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", code]
-        }
-
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-
-            // Schedule a kill after timeout
-            let killItem = DispatchWorkItem { [weak process] in
-                process?.terminate()
-            }
-            DispatchQueue.global().asyncAfter(
-                deadline: .now() + Self.scriptTimeoutSeconds,
-                execute: killItem
-            )
-
-            // Read pipes before waiting to avoid deadlock on large output
-            let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-
-            // Cancel the kill timer if process finished in time
-            killItem.cancel()
-
-            let wasKilled = process.terminationStatus == 15 // SIGTERM
-            if wasKilled {
-                return .error(
-                    "Script timed out after \(Int(Self.scriptTimeoutSeconds)) seconds."
-                )
-            }
-
-            let output = String(data: outData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let errorOutput = String(data: errData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-            if process.terminationStatus == 0 {
-                return .success(output.isEmpty ? "Script executed successfully." : output)
-            } else {
-                let msg = errorOutput.isEmpty ? output : errorOutput
-                return .error("Script failed (exit \(process.terminationStatus)): \(msg)")
-            }
-        } catch {
-            return .error("Failed to run script: \(error.localizedDescription)")
-        }
-    }
-
-    private func handleScreenshot(_ arguments: JSONValue?) async -> MCPToolResult {
-        let ref = arguments?.stringValue(forKey: "ref")
-
-        // If a ref is provided, capture that element's bounds
-        if let ref {
-            guard let wrapper = await store.resolve(ref) else {
-                return .error("Unknown ref '\(ref)'. Take a new snapshot first.")
-            }
-
-            guard let bounds = bridge.getBounds(wrapper.element) else {
-                return .error(
-                    "Could not determine bounds for element \(ref). "
-                    + "The element may not have a visible frame."
-                )
-            }
-
-            guard let base64 = screenshotLayer.captureElementBase64(bounds: bounds) else {
-                return .error(
-                    "Failed to capture screenshot of element \(ref). "
-                    + "Screen recording permission may not be granted."
-                )
-            }
-
-            return MCPToolResult(
-                content: [.image(base64: base64, mimeType: "image/png")],
-                isError: false
-            )
-        }
-
-        // No ref -- capture full screen
-        guard let base64 = screenshotLayer.captureFullScreenBase64() else {
-            return .error(
-                "Failed to capture full screen screenshot. "
-                + "Screen recording permission may not be granted. "
-                + "Go to System Settings > Privacy & Security > Screen Recording "
-                + "and add this application."
-            )
-        }
-
-        return MCPToolResult(
-            content: [.image(base64: base64, mimeType: "image/png")],
-            isError: false
-        )
-    }
-
-    private static let maxBatchSize = 20
-
-    private func handleBatch(_ arguments: JSONValue?) async -> MCPToolResult {
-        guard case .object(let dict) = arguments,
-              case .array(let actions) = dict["actions"] else {
-            return .error("Missing required parameter: actions")
-        }
-
-        if actions.count > Self.maxBatchSize {
-            return .error("Batch too large: \(actions.count) actions (max \(Self.maxBatchSize)).")
-        }
-
-        var results: [String] = []
-        for (index, action) in actions.enumerated() {
-            guard case .object(let actionDict) = action,
-                  case .string(let toolName) = actionDict["tool"] else {
-                results.append("action[\(index)]: invalid format")
-                continue
-            }
-
-            if toolName == "pilot_batch" {
-                results.append("action[\(index)]: pilot_batch cannot be nested")
-                continue
-            }
-
-            do {
-                let toolResult = try await callTool(
-                    name: toolName,
-                    arguments: actionDict["params"]
-                )
-                let text = toolResult.content.first?.text ?? "(no output)"
-                results.append("action[\(index)] \(toolName): \(text)")
-            } catch {
-                results.append("action[\(index)] \(toolName): error - \(error)")
+        // Fallback: simple first-space split, but only if first token contains ":"
+        let parts = input.split(separator: " ", maxSplits: 1)
+        if parts.count == 2 {
+            let possibleRef = String(parts[0])
+            if possibleRef.contains(":") {
+                return (possibleRef, String(parts[1]))
             }
         }
 
-        return .success(results.joined(separator: "\n"))
+        return nil
     }
 }

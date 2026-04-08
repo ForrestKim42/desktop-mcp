@@ -7,11 +7,10 @@ import Foundation
 ///
 /// Walks the AX hierarchy starting from the app element, reads attributes
 /// via `AXBridge`, and registers every meaningful element in the
-/// `ElementStore` so it can be referenced later by its opaque ref.
+/// `ElementStore` with `App/TYPE:Label` refs.
 struct SnapshotBuilder: Sendable {
     let bridge: AXBridge
 
-    /// Attributes fetched in a single batch call per element for performance.
     private static let batchAttributes: [String] = [
         kAXRoleAttribute,
         kAXTitleAttribute,
@@ -24,15 +23,7 @@ struct SnapshotBuilder: Sendable {
     // MARK: - Public API
 
     /// Build a complete snapshot of an app's UI tree.
-    ///
-    /// - Parameters:
-    ///   - appElement: The root AXUIElement for the app (from `AXBridge.appElement`).
-    ///   - appName: Display name of the application.
-    ///   - bundleID: Bundle identifier (e.g. "com.apple.Safari"), if available.
-    ///   - pid: Process identifier.
-    ///   - store: The `ElementStore` actor that will hold ref-to-element mappings.
-    ///   - maxDepth: Maximum recursion depth to prevent runaway traversal (default 10).
-    /// - Returns: A fully populated `AppSnapshot`.
+    /// Elements are registered in the store with `appName/TYPE:Label` refs.
     func buildSnapshot(
         appElement: AXUIElement,
         appName: String,
@@ -41,7 +32,8 @@ struct SnapshotBuilder: Sendable {
         store: ElementStore,
         maxDepth: Int = 10
     ) async -> AppSnapshot {
-        await store.reset()
+        // Reset only this app's elements (preserve other apps)
+        await store.resetApp(appName)
 
         let windows = bridge.getWindows(appElement)
         var topLevelElements: [PilotElement] = []
@@ -49,6 +41,7 @@ struct SnapshotBuilder: Sendable {
         for window in windows {
             let element = await buildElement(
                 from: window,
+                appName: appName,
                 store: store,
                 depth: 0,
                 maxDepth: maxDepth
@@ -64,6 +57,7 @@ struct SnapshotBuilder: Sendable {
             for child in children {
                 let element = await buildElement(
                     from: child,
+                    appName: appName,
                     store: store,
                     depth: 0,
                     maxDepth: maxDepth
@@ -74,7 +68,8 @@ struct SnapshotBuilder: Sendable {
             }
         }
 
-        let count = await store.count()
+        await store.markSnapshotted(appName)
+        let count = await store.refsForApp(appName).count
         let formatter = ISO8601DateFormatter()
 
         return AppSnapshot(
@@ -89,11 +84,9 @@ struct SnapshotBuilder: Sendable {
 
     // MARK: - Recursive Tree Building
 
-    /// Build a single `PilotElement` from an `AXUIElement`, recursing into children.
-    ///
-    /// Returns `nil` if the element has no useful information (no role, title, or value).
     private func buildElement(
         from axElement: AXUIElement,
+        appName: String,
         store: ElementStore,
         depth: Int,
         maxDepth: Int
@@ -102,21 +95,18 @@ struct SnapshotBuilder: Sendable {
 
         let role = attrs.role
 
-        // Skip elements with unknown or missing roles that carry no info
         if role == nil && attrs.title == nil && attrs.value == nil && attrs.description == nil {
             return nil
         }
 
-        // Skip explicitly unknown roles
         if role == "AXUnknown" {
             return nil
         }
 
         let wrapper = AXElementWrapper(axElement)
-        let ref = await store.register(wrapper)
         let bounds = bridge.getBounds(axElement)
 
-        // Recurse into children if within depth limit
+        // Build children FIRST so we can inherit labels from them
         var childElements: [PilotElement]?
         if depth < maxDepth {
             let axChildren = bridge.getChildren(axElement)
@@ -125,6 +115,7 @@ struct SnapshotBuilder: Sendable {
                 for child in axChildren {
                     if let childElement = await buildElement(
                         from: child,
+                        appName: appName,
                         store: store,
                         depth: depth + 1,
                         maxDepth: maxDepth
@@ -136,12 +127,34 @@ struct SnapshotBuilder: Sendable {
             }
         }
 
+        // For unlabeled container elements (GROUP, ROW, CELL), inherit label
+        // by recursively searching descendants for the first meaningful text.
+        var effectiveTitle = attrs.title
+        var effectiveDesc = attrs.description
+        if effectiveTitle == nil && effectiveDesc == nil {
+            let containerRoles = Set(["AXGroup", "AXRow", "AXCell", "AXOutlineRow"])
+            if let r = role, containerRoles.contains(r), let children = childElements {
+                if let inherited = Self.findFirstLabel(in: children) {
+                    effectiveTitle = inherited
+                }
+            }
+        }
+
+        let ref = await store.register(
+            wrapper,
+            appName: appName,
+            role: role,
+            title: effectiveTitle,
+            description: effectiveDesc,
+            value: attrs.value
+        )
+
         return PilotElement(
             ref: ref,
             role: role ?? "AXUnknown",
-            title: attrs.title,
+            title: effectiveTitle,
             value: attrs.value,
-            description: attrs.description,
+            description: effectiveDesc,
             enabled: attrs.enabled,
             focused: attrs.focused,
             bounds: bounds,
@@ -149,9 +162,37 @@ struct SnapshotBuilder: Sendable {
         )
     }
 
+    // MARK: - Label Inheritance
+
+    /// Recursively find the first meaningful label in a subtree.
+    /// Skips IMAGE elements (icons) and prefers TEXT/BUTTON/INPUT labels.
+    private static func findFirstLabel(in elements: [PilotElement]) -> String? {
+        for element in elements {
+            // Skip images — they're usually icons, not meaningful labels
+            if element.role == "AXImage" { continue }
+
+            // Check this element's title
+            if let t = element.title, !t.isEmpty,
+               !t.contains("<AXValue 0x"), t.count > 1 {
+                return t
+            }
+            if let d = element.description, !d.isEmpty,
+               !d.contains("<AXValue 0x"), d.count > 1 {
+                return d
+            }
+
+            // Recurse into children
+            if let children = element.children {
+                if let found = findFirstLabel(in: children) {
+                    return found
+                }
+            }
+        }
+        return nil
+    }
+
     // MARK: - Batch Attribute Reading
 
-    /// Holds the parsed result of a batch attribute read.
     private struct BatchResult {
         let role: String?
         let title: String?
@@ -161,14 +202,12 @@ struct SnapshotBuilder: Sendable {
         let focused: Bool
     }
 
-    /// Read all standard attributes in one batch call for performance.
     private func readBatchAttributes(_ element: AXUIElement) -> BatchResult {
         let values = bridge.getAttributes(element, Self.batchAttributes)
 
         let role = values[0] as? String
         let title = values[1] as? String
 
-        // Value needs special handling: could be String, NSNumber, etc.
         let value: String? = {
             guard let raw = values[2] else { return nil }
             if let str = raw as? String { return str }
