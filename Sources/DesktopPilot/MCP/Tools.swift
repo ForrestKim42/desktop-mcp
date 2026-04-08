@@ -433,7 +433,7 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             }
 
             // Try to find and connect to CDP
-            if let port = await CDPBridge.findCDPPort(for: bundleID) {
+            if let port = await CDPBridge.findCDPPort(for: bundleID, pid: app.pid) {
                 let cdp = CDPBridge(port: port)
                 do {
                     try await cdp.connect()
@@ -485,21 +485,24 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         }
     }
 
-    /// Format the current screen state as a flat element list.
+    /// Format screen state. For CDP apps, returns the smart summary.
+    /// For native AX apps, returns the flat element list.
     private func formatScreen(app: (name: String, pid: Int32)) async -> String {
-        let refs = await store.refsForApp(app.name)
+        // CDP apps: use pre-built summary
+        if let summary = await CDPElementHolder.shared.getSummary(appName: app.name) {
+            return "[\(app.name)]\n\(summary)"
+        }
 
+        // AX apps: flat list
+        let refs = await store.refsForApp(app.name)
         if refs.isEmpty {
             return "[\(app.name)] No accessible elements found."
         }
 
-        // Build tree from refs by re-reading the snapshot structure
-        // For simplicity, just list all refs in order
         var lines = ["[\(app.name)] \(refs.count) elements:"]
         for ref in refs {
             lines.append("  \(ref)")
         }
-
         return lines.joined(separator: "\n")
     }
 

@@ -38,13 +38,16 @@ struct SnapshotBuilder: Sendable {
         let windows = bridge.getWindows(appElement)
         var topLevelElements: [PilotElement] = []
 
-        for window in windows {
+        for (index, window) in windows.enumerated() {
+            // Frontmost window (index 0): full depth snapshot
+            // Background windows: title only (depth 0) for fast discovery
+            let depthForWindow = (index == 0) ? maxDepth : 0
             let element = await buildElement(
                 from: window,
                 appName: appName,
                 store: store,
                 depth: 0,
-                maxDepth: maxDepth
+                maxDepth: depthForWindow
             )
             if let element {
                 topLevelElements.append(element)

@@ -402,16 +402,89 @@ extension CDPBridge {
         return false
     }
 
-    /// Try common CDP ports for an Electron app.
-    /// Returns the first available port, or nil.
-    public static func findCDPPort(for bundleID: String?) async -> Int? {
-        // Try common ports
-        let ports = [9222, 9229, 9223, 9224, 9225]
-        for port in ports {
+    /// Find the CDP port owned by a specific process.
+    ///
+    /// Uses `lsof` to discover which TCP ports the target PID is listening on,
+    /// then verifies each with a CDP handshake. Falls back to scanning common
+    /// ports with PID verification via `/json/version` User-Agent.
+    public static func findCDPPort(for bundleID: String?, pid: Int32) async -> Int? {
+        // Strategy 1: lsof — find ports the target PID actually listens on
+        if let port = findListeningCDPPort(pid: pid) {
             if await isAvailable(port: port) {
                 return port
             }
         }
+
+        // Strategy 2: scan common ports, but verify ownership via PID
+        let ports = [9222, 9229, 9223, 9224, 9225]
+        for port in ports {
+            if isOwnedByPid(port: port, pid: pid) {
+                return port
+            }
+        }
         return nil
+    }
+
+    /// Use `lsof` to find TCP ports a given PID is listening on.
+    private static func findListeningCDPPort(pid: Int32) -> Int? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-i", "TCP", "-sTCP:LISTEN", "-P", "-n", "-p", "\(pid)", "-Fn"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+        // lsof -Fn outputs lines like "n*:9222" or "n127.0.0.1:9222"
+        for line in output.components(separatedBy: "\n") {
+            guard line.hasPrefix("n") else { continue }
+            let addr = String(line.dropFirst()) // strip "n" prefix
+            if let colonIdx = addr.lastIndex(of: ":") {
+                let portStr = String(addr[addr.index(after: colonIdx)...])
+                if let port = Int(portStr), port >= 1024 {
+                    return port
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Check if a CDP port is owned by the given PID by inspecting `lsof`.
+    private static func isOwnedByPid(port: Int, pid: Int32) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-i", "TCP:\(port)", "-sTCP:LISTEN", "-P", "-n", "-Fp"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return false
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return false }
+
+        // lsof -Fp outputs lines like "p12910"
+        for line in output.components(separatedBy: "\n") {
+            guard line.hasPrefix("p") else { continue }
+            let pidStr = String(line.dropFirst())
+            if let ownerPid = Int32(pidStr), ownerPid == pid {
+                return true
+            }
+        }
+        return false
     }
 }
