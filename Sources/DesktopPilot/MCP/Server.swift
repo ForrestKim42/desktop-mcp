@@ -467,7 +467,7 @@ public final class MCPServer: Sendable {
         Log.info("Handling initialize")
 
         let result: JSONValue = .object([
-            "protocolVersion": .string("2024-11-05"),
+            "protocolVersion": .string("2025-03-26"),
             "capabilities": .object([
                 "tools": .object([:])
             ]),

@@ -20,7 +20,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/VersoXBT/desktop-pilot-mcp.git"
+    "url": "git+https://github.com/VersoXBT/desktop-pilot-mcp.git"
   },
   "homepage": "https://github.com/VersoXBT/desktop-pilot-mcp",
   "bugs": {
@@ -48,5 +48,11 @@
   },
   "engines": {
     "node": ">=16"
+  },
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
   }
 }

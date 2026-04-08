@@ -97,6 +97,65 @@ final class AccessibilityLayer: @unchecked Sendable, InteractionLayer {
 
     func click(ref: String) throws {
         let wrapper = try resolveRef(ref)
+
+        // AXWindow → raise window to front via System Events AppleScript
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(wrapper.element, kAXRoleAttribute as CFString, &role)
+        if let r = role as? String, r == "AXWindow" {
+            var pidValue: pid_t = 0
+            AXUIElementGetPid(wrapper.element, &pidValue)
+
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(wrapper.element, kAXTitleAttribute as CFString, &titleRef)
+            let windowTitle = (titleRef as? String) ?? ""
+
+            // Get the process name (not localized name — System Events uses process name)
+            let appName: String
+            if let app = NSRunningApplication(processIdentifier: pidValue) {
+                appName = app.localizedName ?? app.bundleIdentifier ?? "unknown"
+            } else {
+                appName = "unknown"
+            }
+
+            let helper = SystemEventsHelper()
+            let escaped = windowTitle
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let escapedApp = appName
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+
+            let script = """
+                tell application "System Events"
+                    tell process "\(escapedApp)"
+                        set frontmost to true
+                        repeat with w in windows
+                            if name of w is "\(escaped)" then
+                                perform action "AXRaise" of w
+                                return "ok"
+                            end if
+                        end repeat
+                        return "not found"
+                    end tell
+                end tell
+                """
+
+            let result = helper.runAppleScript(script)
+            switch result {
+            case .success(let output):
+                if output == "ok" { return }
+            case .failure:
+                break
+            }
+
+            // Fallback: direct AXRaise + activate (works for well-behaved apps)
+            AXUIElementPerformAction(wrapper.element, kAXRaiseAction as CFString)
+            if let app = NSRunningApplication(processIdentifier: pidValue) {
+                app.activate(options: .activateIgnoringOtherApps)
+            }
+            return
+        }
+
         let pressed = bridge.performAction(wrapper.element, kAXPressAction)
         if !pressed {
             throw PlatformError.actionFailed(

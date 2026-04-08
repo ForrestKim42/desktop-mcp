@@ -30,7 +30,8 @@ struct SnapshotBuilder: Sendable {
         bundleID: String?,
         pid: Int32,
         store: ElementStore,
-        maxDepth: Int = 10
+        maxDepth: Int = 10,
+        focusWindowTitle: String? = nil
     ) async -> AppSnapshot {
         // Reset only this app's elements (preserve other apps)
         await store.resetApp(appName)
@@ -39,9 +40,15 @@ struct SnapshotBuilder: Sendable {
         var topLevelElements: [PilotElement] = []
 
         for (index, window) in windows.enumerated() {
-            // Frontmost window (index 0): full depth snapshot
-            // Background windows: title only (depth 0) for fast discovery
-            let depthForWindow = (index == 0) ? maxDepth : 0
+            // If focusWindowTitle specified: that window = full depth, others = title only
+            // Otherwise: frontmost (index 0) = full depth, others = title only
+            let windowTitle = bridge.getTitle(window)
+            let depthForWindow: Int
+            if let focus = focusWindowTitle {
+                depthForWindow = (windowTitle == focus) ? maxDepth : 0
+            } else {
+                depthForWindow = (index == 0) ? maxDepth : 0
+            }
             let element = await buildElement(
                 from: window,
                 appName: appName,

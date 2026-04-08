@@ -171,6 +171,24 @@ struct SystemEventsHelper: Sendable {
         return runAppleScript(script)
     }
 
+    /// Click at screen coordinates, scoped to a specific process.
+    /// System Events routes the click to the process's hit-test even when the
+    /// app is in the background — works for Electron apps where AXPress fails.
+    func clickAtPoint(
+        appName: String,
+        x: Double,
+        y: Double
+    ) -> Result<String, Error> {
+        let script = """
+            tell application "System Events"
+                tell process "\(escapeForAppleScript(appName))"
+                    click at {\(Int(x)), \(Int(y))}
+                end tell
+            end tell
+            """
+        return runAppleScript(script)
+    }
+
     /// Get the UI element tree for an app via System Events.
     ///
     /// Returns a text listing of every window and its contents

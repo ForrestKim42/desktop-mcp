@@ -118,9 +118,9 @@ public actor ElementStore {
 
         if let t = isClean(title) { return t }
         if let d = isClean(description) { return d }
-        if !isInput, let v = isClean(value), !v.isEmpty {
-            if v.count > 40 {
-                return String(v.prefix(37)) + "..."
+        if let v = isClean(value), !v.isEmpty {
+            if v.count > 80 {
+                return String(v.prefix(77)) + "..."
             }
             return v
         }

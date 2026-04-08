@@ -19,6 +19,17 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     /// Active CDP connections keyed by app name.
     private var cdpConnections: [String: CDPBridge] = [:]
 
+    /// Next CDP port to allocate when restarting an Electron app.
+    /// Each Electron app gets its own port to avoid collisions.
+    private var nextCDPPort: Int = 9222
+
+    /// Apps where CDP restart was already attempted (success or fail).
+    /// Prevents repeated restart loops within a single session.
+    private var cdpRestartAttempted: Set<String> = []
+
+    /// Per-app snapshot cache for diff computation.
+    private let snapshotCache = UISnapshotCache()
+
     public init(bridge: AXBridge, store: ElementStore) {
         self.bridge = bridge
         self.store = store
@@ -88,6 +99,14 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                             + "Individual actions can override with App/TYPE:Label prefix."
                         ),
                     ]),
+                    "window": .object([
+                        "type": .string("string"),
+                        "description": .string(
+                            "Target window title. When set, only this window gets a full-depth snapshot "
+                            + "and interactions target it — even if it's behind other windows. "
+                            + "Other windows are listed by title only. Enables background interaction."
+                        ),
+                    ]),
                     "actions": .object([
                         "description": .string(
                             "Action string or JSON array of action strings. Omit to just read the screen."
@@ -118,6 +137,7 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         }
 
         let appName = arguments?.stringValue(forKey: "app")
+        let windowName = arguments?.stringValue(forKey: "window")
         let actionsInput: JSONValue? = {
             guard case .object(let dict) = arguments else { return nil }
             return dict["actions"]
@@ -127,8 +147,8 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             return .error("Could not find app: \(appName ?? "frontmost"). Is it running?")
         }
 
-        // Take initial snapshot of default app
-        await takeSnapshot(app: defaultApp)
+        // Take initial snapshot — if window specified, only that window gets full depth
+        await takeSnapshot(app: defaultApp, focusWindowTitle: windowName)
 
         // If no actions, just return the screen state
         guard let actionStrings = ActionParser.parseActions(actionsInput), !actionStrings.isEmpty else {
@@ -154,8 +174,17 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             output.append(result)
         }
 
+        // Electron apps (React/Vue) update the DOM asynchronously after navigation.
+        // A short delay lets the virtual DOM settle so the snapshot captures the
+        // post-action state instead of the stale pre-action DOM.
+        let finalAppInfo = registry.findApp(pid: currentDefaultApp.pid)
+        if CDPBridge.isElectronApp(bundleID: finalAppInfo?.bundleID, pid: currentDefaultApp.pid) {
+            try? await Task.sleep(nanoseconds: 800_000_000)
+        }
+
         // Take final snapshot and append screen state
-        await takeSnapshot(app: currentDefaultApp)
+        // Reuse windowName so multi-window apps don't time out building full depth for every window
+        await takeSnapshot(app: currentDefaultApp, focusWindowTitle: windowName)
         let screenState = await formatScreen(app: currentDefaultApp)
 
         output.append("---")
@@ -237,8 +266,8 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             return "> tap \(target)\n  ERROR: element not found"
         }
 
-        // Activate the target app first
-        activateApp(pid: resolved.app.pid)
+        // NOTE: Do NOT activate the app by default — allows background interaction
+        // without stealing focus from the user's current work.
 
         // Check if this is a CDP element (DOM index based)
         let fullRef = target.contains("/") ? target : "\(resolved.app.name)/\(resolved.elementRef)"
@@ -262,16 +291,80 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             }
         }
 
-        // AXPress (semantic click)
+        // WINDOW element → raise via System Events (brings window to front)
+        let isWindow = resolved.elementRef.hasPrefix("WINDOW:") ||
+                       bridge.getRole(wrapper.element) == "AXWindow"
+        if isWindow {
+            let windowTitle = bridge.getTitle(wrapper.element) ?? ""
+            let appName = resolved.app.name
+            let helper = SystemEventsHelper()
+
+            let escapedTitle = windowTitle
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let escapedApp = appName
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+
+            let script = """
+                tell application "System Events"
+                    tell process "\(escapedApp)"
+                        set frontmost to true
+                        repeat with w in windows
+                            if name of w is "\(escapedTitle)" then
+                                perform action "AXRaise" of w
+                                return "ok"
+                            end if
+                        end repeat
+                        return "not found"
+                    end tell
+                end tell
+                """
+
+            let result = helper.runAppleScript(script)
+            if case .success(let output) = result, output == "ok" {
+                return "> tapped \(target) (window raised)"
+            }
+
+            bridge.performAction(wrapper.element, kAXRaiseAction)
+            activateApp(pid: resolved.app.pid)
+            return "> tapped \(target) (window raised via AXRaise)"
+        }
+
+        // Electron apps (Discord/Slack/etc.) without an active CDP connection:
+        // AXPress reports success but React components ignore it because they
+        // only listen to real DOM mouse events. Try System Events `click at` —
+        // it routes through the target process's hit-test and works in the
+        // background. Fall back to CGEvent.postToPid if AppleScript fails.
+        let appInfo = registry.findApp(pid: resolved.app.pid)
+        let bundleID = appInfo?.bundleID
+        let isElectron = CDPBridge.isElectronApp(bundleID: bundleID, pid: resolved.app.pid)
+        if isElectron, cdpConnections[resolved.app.name] == nil {
+            if let bounds = bridge.getBounds(wrapper.element) {
+                let centerX = bounds.x + bounds.width / 2.0
+                let centerY = bounds.y + bounds.height / 2.0
+                let helper = SystemEventsHelper()
+                let result = helper.clickAtPoint(
+                    appName: resolved.app.name, x: centerX, y: centerY
+                )
+                if case .success = result {
+                    return "> tapped \(target) (System Events click)"
+                }
+                cgEventLayer.clickElementBackground(bounds: bounds, pid: resolved.app.pid)
+                return "> tapped \(target) (CGEvent background click)"
+            }
+        }
+
+        // AXPress — works in background for native macOS apps
         let success = bridge.performAction(wrapper.element, kAXPressAction)
         if success {
             return "> tapped \(target)"
         }
 
-        // Fallback: CGEvent coordinate click
+        // Fallback: background coordinate click (works without raising the window)
         if let bounds = bridge.getBounds(wrapper.element) {
-            cgEventLayer.clickElement(bounds: bounds)
-            return "> tapped \(target) (via coordinates)"
+            cgEventLayer.clickElementBackground(bounds: bounds, pid: resolved.app.pid)
+            return "> tapped \(target) (background coordinates)"
         }
 
         return "> tap \(target)\n  ERROR: click failed"
@@ -285,7 +378,7 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         // Strategy: try matching against known refs in the store, longest match first
         if let (possibleRef, actualText) = await splitRefAndText(text, defaultApp: defaultApp) {
             if let resolved = await resolveTargetApp(from: possibleRef, defaultApp: &defaultApp) {
-                activateApp(pid: resolved.app.pid)
+                // NOTE: Do NOT activate app — background interaction
 
                 // Check CDP path first
                 let fullRef = possibleRef.contains("/") ? possibleRef : "\(resolved.app.name)/\(possibleRef)"
@@ -324,8 +417,10 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                         return "> typed \"\(actualText)\" into \(possibleRef)"
                     }
 
+                    // CGEvent typing requires app to be frontmost
+                    activateApp(pid: resolved.app.pid)
                     cgEventLayer.typeString(actualText)
-                    return "> typed \"\(actualText)\" into \(possibleRef) (via keyboard)"
+                    return "> typed \"\(actualText)\" into \(possibleRef) (via keyboard, activated)"
                 }
             }
         }
@@ -421,28 +516,26 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     // MARK: - Snapshot & Formatting
 
     @discardableResult
-    private func takeSnapshot(app: (name: String, pid: Int32)) async -> AppSnapshot {
+    private func takeSnapshot(app: (name: String, pid: Int32), focusWindowTitle: String? = nil) async -> AppSnapshot {
         let appInfo = registry.findApp(pid: app.pid)
         let bundleID = appInfo?.bundleID
 
         // Check if this is an Electron app with CDP available
         if CDPBridge.isElectronApp(bundleID: bundleID, pid: app.pid) {
-            if let cdp = cdpConnections[app.name] {
-                // Already connected — use CDP
-                return await takeCDPSnapshot(cdp: cdp, app: app, bundleID: bundleID)
-            }
-
-            // Try to find and connect to CDP
-            if let port = await CDPBridge.findCDPPort(for: bundleID, pid: app.pid) {
-                let cdp = CDPBridge(port: port)
-                do {
-                    try await cdp.connect()
-                    cdpConnections[app.name] = cdp
-                    Log.info("CDP connected to \(app.name) on port \(port)")
-                    return await takeCDPSnapshot(cdp: cdp, app: app, bundleID: bundleID)
-                } catch {
-                    Log.info("CDP connection failed for \(app.name): \(error). Falling back to AX.")
+            if let cdp = await ensureCDPConnection(
+                appName: app.name, bundleID: bundleID, pid: app.pid
+            ) {
+                // CDP path produces DOM-level snapshots and click handling.
+                // The app may have been restarted; resolve the new PID.
+                let resolvedApp: (name: String, pid: Int32)
+                if let updated = registry.findApp(name: app.name) {
+                    resolvedApp = (updated.name, updated.pid)
+                } else {
+                    resolvedApp = app
                 }
+                return await takeCDPSnapshot(
+                    cdp: cdp, app: resolvedApp, bundleID: bundleID
+                )
             }
         }
 
@@ -454,8 +547,106 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             bundleID: bundleID,
             pid: app.pid,
             store: store,
-            maxDepth: 100
+            maxDepth: 100,
+            focusWindowTitle: focusWindowTitle
         )
+    }
+
+    /// Resolve (or establish) a CDP connection for an Electron app.
+    ///
+    /// Strategy:
+    /// 1. Reuse a cached connection if alive.
+    /// 2. Look for an existing CDP port the app is already listening on.
+    /// 3. Restart the app with `--remote-debugging-port=<allocated>` (one-time
+    ///    per session) and connect to it.
+    ///
+    /// Returns nil only when restart fails or has already been attempted in
+    /// this session — callers should fall back to AX in that case.
+    private func ensureCDPConnection(
+        appName: String,
+        bundleID: String?,
+        pid: Int32
+    ) async -> CDPBridge? {
+        // 1. Cached
+        if let cdp = cdpConnections[appName] {
+            return cdp
+        }
+
+        // 2. Discover existing CDP port (app may already be running with --remote-debugging-port)
+        if let port = await CDPBridge.findCDPPort(for: bundleID, pid: pid) {
+            let cdp = CDPBridge(port: port)
+            do {
+                try await cdp.connect()
+                cdpConnections[appName] = cdp
+                Log.info("CDP connected to \(appName) on existing port \(port)")
+                return cdp
+            } catch {
+                Log.info("CDP connect to existing port \(port) failed for \(appName): \(error)")
+            }
+        }
+
+        // 3. Auto-restart with CDP enabled (one attempt per app per session)
+        guard let bid = bundleID, !cdpRestartAttempted.contains(appName) else {
+            return nil
+        }
+        cdpRestartAttempted.insert(appName)
+
+        let port = allocateFreeCDPPort()
+
+        Log.info("Restarting \(appName) with --remote-debugging-port=\(port)")
+        let restarted = await CDPBridge.restartWithCDP(
+            bundleID: bid, currentPid: pid, port: port
+        )
+        guard restarted else {
+            Log.info("Failed to restart \(appName) with CDP enabled")
+            return nil
+        }
+
+        // Allow registry to pick up the new pid
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        // restartWithCDP returned true → CDP responded on `port`. Since
+        // allocateFreeCDPPort skips ports already in use, this CDP must be
+        // the app we just relaunched. Connect directly.
+        let cdp = CDPBridge(port: port)
+        do {
+            try await cdp.connect()
+            cdpConnections[appName] = cdp
+            Log.info("CDP connected to \(appName) on new port \(port) after restart")
+            return cdp
+        } catch {
+            Log.info("CDP connect after restart failed for \(appName): \(error)")
+            return nil
+        }
+    }
+
+    /// Find an unused TCP port for CDP, starting at `nextCDPPort`.
+    /// Skips ports already listened on by any process to prevent collisions
+    /// between Electron apps that are already in CDP mode.
+    private func allocateFreeCDPPort() -> Int {
+        var port = nextCDPPort
+        while isPortListening(port) {
+            port += 1
+        }
+        nextCDPPort = port + 1
+        return port
+    }
+
+    private func isPortListening(_ port: Int) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-i", "TCP:\(port)", "-sTCP:LISTEN", "-P", "-n"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return false
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return !data.isEmpty
     }
 
     private func takeCDPSnapshot(
@@ -485,25 +676,30 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         }
     }
 
-    /// Format screen state. For CDP apps, returns the smart summary.
-    /// For native AX apps, returns the flat element list.
+    /// Format screen state through the unified IR pipeline.
+    ///
+    /// Both CDP (Electron) and AX (native) snapshots flow through the same
+    /// path: Collector → ElementStore → Compressor → Formatter. The CDP-only
+    /// `summary` is carried as a side-channel field on the IR.
+    ///
+    /// Per-app snapshot cache also produces a change diff so repeated calls
+    /// against the same app advertise what moved instead of dumping the full
+    /// state again.
     private func formatScreen(app: (name: String, pid: Int32)) async -> String {
-        // CDP apps: use pre-built summary
-        if let summary = await CDPElementHolder.shared.getSummary(appName: app.name) {
-            return "[\(app.name)]\n\(summary)"
-        }
-
-        // AX apps: flat list
+        let summary = await CDPElementHolder.shared.getSummary(appName: app.name)
         let refs = await store.refsForApp(app.name)
-        if refs.isEmpty {
+
+        if refs.isEmpty && (summary?.isEmpty ?? true) {
             return "[\(app.name)] No accessible elements found."
         }
 
-        var lines = ["[\(app.name)] \(refs.count) elements:"]
-        for ref in refs {
-            lines.append("  \(ref)")
-        }
-        return lines.joined(separator: "\n")
+        let change = await snapshotCache.recordAndDiff(
+            appName: app.name, currentRefs: refs
+        )
+        let compressed = UISnapshotCompressor.compress(
+            appName: app.name, refs: refs, summary: summary
+        )
+        return UISnapshotFormatter.format(compressed, change: change)
     }
 
     // MARK: - App Resolution & Activation

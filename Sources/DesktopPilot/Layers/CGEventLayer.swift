@@ -108,6 +108,36 @@ final class CGEventLayer: @unchecked Sendable {
         clickAt(x: centerX, y: centerY)
     }
 
+    /// Click at screen coordinates, delivering events directly to a specific PID.
+    /// Bypasses window z-order — the target app receives the click even when it
+    /// is in the background. Used for Electron apps (Discord/Slack) where AXPress
+    /// fails because React components only respond to real DOM click events.
+    func clickAtBackground(x: Double, y: Double, pid: pid_t) {
+        let point = CGPoint(x: x, y: y)
+
+        let mouseDown = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseDown,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        )
+        let mouseUp = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseUp,
+            mouseCursorPosition: point,
+            mouseButton: .left
+        )
+
+        mouseDown?.postToPid(pid)
+        mouseUp?.postToPid(pid)
+    }
+
+    func clickElementBackground(bounds: ElementBounds, pid: pid_t) {
+        let centerX = bounds.x + bounds.width / 2.0
+        let centerY = bounds.y + bounds.height / 2.0
+        clickAtBackground(x: centerX, y: centerY, pid: pid)
+    }
+
     /// Double-click at screen coordinates.
     func doubleClickAt(x: Double, y: Double) {
         let point = CGPoint(x: x, y: y)

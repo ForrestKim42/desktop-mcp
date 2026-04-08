@@ -402,6 +402,65 @@ extension CDPBridge {
         return false
     }
 
+    /// Restart an Electron app with the CDP debugger enabled on a specific port.
+    ///
+    /// Terminates the running instance, then relaunches via `open -na <appPath>
+    /// --args --remote-debugging-port=<port>`. Waits for the new process to
+    /// expose CDP on the requested port. Used to enable DOM-level interaction
+    /// for Electron apps (Discord/Slack/etc.) that started without `--remote-debugging-port`.
+    ///
+    /// Note: this terminates the existing process. Unsaved in-memory state in
+    /// the target app may be lost. Caller should only invoke when CDP is the
+    /// only viable interaction path.
+    public static func restartWithCDP(
+        bundleID: String,
+        currentPid: Int32,
+        port: Int
+    ) async -> Bool {
+        guard let appURL = NSWorkspace.shared.urlForApplication(
+            withBundleIdentifier: bundleID
+        ) else {
+            return false
+        }
+
+        // Terminate existing instance
+        if let app = NSRunningApplication(processIdentifier: currentPid) {
+            app.terminate()
+            // Wait up to 3s for termination
+            for _ in 0..<30 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if app.isTerminated { break }
+            }
+            if !app.isTerminated {
+                app.forceTerminate()
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+
+        // Relaunch with --remote-debugging-port
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [
+            "-na", appURL.path,
+            "--args", "--remote-debugging-port=\(port)"
+        ]
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return false
+        }
+
+        // Wait up to 10s for CDP to come up on the requested port
+        for _ in 0..<50 {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            if await isAvailable(port: port) {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Find the CDP port owned by a specific process.
     ///
     /// Uses `lsof` to discover which TCP ports the target PID is listening on,
