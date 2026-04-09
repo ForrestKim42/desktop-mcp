@@ -20,22 +20,23 @@ Desktop Pilot is an MCP server that gives Claude direct access to any macOS appl
 
 **One snapshot of Telegram takes 20ms and returns structured data. The same operation with screenshot-based computer-use takes ~3 seconds and returns pixels.**
 
+Desktop Pilot exposes a single tool, `desktop_do`, driven by a path grammar. A path is a `/`-joined sequence of segments — an app name, a ref (`TYPE:Label[@N]`), or a verb (`tap`, `type:<text>`, `press:<key>`, `find:<query>`, `expect:<name>`, `wait:<ms>`, `scroll:<dir>`). A trailing `?` dumps the end-state view; `!` is assert-only; no marker is a silent ok/error. `paths` is an array — batched flows collapse into one call and only the paths you mark with `?` produce a view dump.
+
+```js
+// Read Telegram.
+desktop_do({ paths: ["Telegram?"] })
+
+// Find, focus, type, send — one call, one dump at the end.
+desktop_do({ paths: [
+  "Telegram/find:Saved Messages/tap",
+  "Telegram/INPUT:Write a message.../type:Hello from Claude",
+  "Telegram/press:RETURN?"
+]})
 ```
-pilot_snapshot { "app": "Telegram" }
 
-[e1] Window "Saved Messages"
-  [e2] MenuButton "Main menu"
-  [e3] Button "All chats (111 unread chats)"
-  [e7] Button "Code (4 unread chats)"
-  [e18] TextField "Write a message..."
-  [e20] Button "Record Voice Message"
+No coordinates. No screenshots. No guessing. Just paths of refs.
 
-pilot_click { "ref": "e18" }       // focus the text field
-pilot_type  { "ref": "e18", "text": "Hello from Claude" }
-pilot_click { "ref": "e20" }       // send
-```
-
-No coordinates. No screenshots. No guessing. Just refs.
+See [`docs/PATH_API.md`](docs/PATH_API.md) for the full grammar and rationale.
 
 ---
 
