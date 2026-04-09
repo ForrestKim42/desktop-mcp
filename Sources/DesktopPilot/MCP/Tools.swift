@@ -402,21 +402,18 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                     }
                 }
 
-                // AX path
+                // Native AX path.
+                // Strategy: focus the element, then type via PID-targeted unicode
+                // keystrokes (postToPid). This delivers real key events to the
+                // target app's run loop in the background — no focus stealing —
+                // and triggers the app's input handlers (so e.g. KakaoTalk's
+                // RETURN-to-send recognizes the typed text). AXSetValue alone
+                // does not work for many native apps because their UI model
+                // never sees the value change.
                 if let wrapper = await store.resolve(possibleRef, defaultApp: resolved.app.name) {
                     _ = bridge.setAttribute(wrapper.element, kAXFocusedAttribute, true as CFTypeRef)
-
-                    let success = bridge.setAttribute(
-                        wrapper.element, kAXValueAttribute, actualText as CFTypeRef
-                    )
-                    if success {
-                        return "> typed \"\(actualText)\" into \(possibleRef)"
-                    }
-
-                    // CGEvent typing requires app to be frontmost
-                    activateApp(pid: resolved.app.pid)
-                    cgEventLayer.typeString(actualText)
-                    return "> typed \"\(actualText)\" into \(possibleRef) (via keyboard, activated)"
+                    cgEventLayer.typeString(actualText, pid: resolved.app.pid)
+                    return "> typed \"\(actualText)\" into \(possibleRef) (background keystroke)"
                 }
             }
         }
@@ -429,13 +426,14 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                 ])
                 return "> typed \"\(text)\" (CDP insertText)"
             } catch {
-                // CDP insertText failed, fall through to CGEvent
+                // CDP insertText failed; fall through to error.
             }
         }
 
-        // Last resort: CGEvent typing into whatever is focused (foreground only)
-        cgEventLayer.typeString(text)
-        return "> typed \"\(text)\" (CGEvent, foreground)"
+        // Background-only: refuse CGEvent foreground typing.
+        return "> type\n  ERROR: no AX/CDP target resolved for \"\(text)\". " +
+               "Background-only mode: refusing CGEvent foreground fallback. " +
+               "Use a path of the form `App/TYPE:Label/tap/type:hello` so the ref propagates."
     }
 
     private func executePress(key: String, pid: pid_t) -> String {
@@ -825,7 +823,8 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                     continue
                 }
                 let outcome = await executeVerb(
-                    name: name, args: args, focusedRef: lastRef, app: app
+                    name: name, args: args, focusedRef: lastRef, app: app,
+                    windowName: windowName
                 )
                 lines.append("  " + outcome.message)
                 if let produced = outcome.producedRef {
@@ -894,11 +893,19 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     }
 
     /// Dispatch a single verb segment against the current app + focus.
+    ///
+    /// `windowName` is the optional `window:` parameter from the desktop_do
+    /// call. When set, type/press verbs raise that window inside the target
+    /// app's PID before delivering keystrokes — guarantees the keystroke
+    /// lands in the intended chat room / document, not whatever window the
+    /// user happened to be looking at. This is true background raise:
+    /// PID-only AXRaise + kAXMain/Focused, no app activation.
     private func executeVerb(
         name: String,
         args: String?,
         focusedRef: String?,
-        app: (name: String, pid: Int32)
+        app: (name: String, pid: Int32),
+        windowName: String? = nil
     ) async -> VerbOutcome {
         var app = app
         switch name {
@@ -910,9 +917,11 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                 )
             }
             let msg = await executeTap(target: target, defaultApp: &app)
+            let failed = msg.contains("ERROR")
+            // Propagate the tapped ref so a following `type:` / `press:` can target it.
             return VerbOutcome(
-                message: msg, producedRef: nil, nextApp: app,
-                failed: msg.contains("ERROR")
+                message: msg, producedRef: failed ? nil : target, nextApp: app,
+                failed: failed
             )
 
         case "doubletap", "dclick", "doubleclick":
@@ -923,12 +932,19 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                 )
             }
             let msg = await executeDoubleTap(target: target, defaultApp: &app)
+            let failed = msg.contains("ERROR")
             return VerbOutcome(
-                message: msg, producedRef: nil, nextApp: app,
-                failed: msg.contains("ERROR")
+                message: msg, producedRef: failed ? nil : target, nextApp: app,
+                failed: failed
             )
 
         case "type":
+            // Background raise the target window inside its PID before
+            // delivering keystrokes — otherwise postToPid lands in whichever
+            // window of the same app currently has key focus.
+            if let wn = windowName {
+                _ = bridge.raiseWindowInApp(pid: app.pid, windowTitle: wn)
+            }
             let text = args ?? ""
             let composed: String
             if let ref = focusedRef, !ref.isEmpty {
@@ -937,16 +953,23 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                 composed = text
             }
             let msg = await executeType(text: composed, defaultApp: &app)
+            // Preserve focused ref so subsequent type/press verbs can chain
+            // (e.g. tap/type:line1/press:RETURN/type:line2/press:RETURN).
             return VerbOutcome(
-                message: msg, producedRef: nil, nextApp: app,
+                message: msg, producedRef: focusedRef, nextApp: app,
                 failed: msg.contains("ERROR")
             )
 
         case "press":
+            // Same window-targeting guarantee as `type`.
+            if let wn = windowName {
+                _ = bridge.raiseWindowInApp(pid: app.pid, windowTitle: wn)
+            }
             let key = (args ?? "").uppercased()
             let msg = executePress(key: key, pid: app.pid)
+            // Preserve focus — pressing a key doesn't reassign the active element.
             return VerbOutcome(
-                message: msg, producedRef: nil, nextApp: nil,
+                message: msg, producedRef: focusedRef, nextApp: nil,
                 failed: msg.contains("ERROR")
             )
 

@@ -232,6 +232,40 @@ public final class AXBridge: @unchecked Sendable {
         return (value as! AXUIElement) // swiftlint:disable:this force_cast
     }
 
+    /// Raise a window to the top of its app's window stack — PID-only,
+    /// without activating the app system-wide. This is the background-safe
+    /// way to make a specific window the key window inside its process so
+    /// that subsequent `postToPid` keystrokes are delivered there.
+    ///
+    /// Combines:
+    ///   - `AXRaise` action      → reorders within the app's window list
+    ///   - `kAXMainAttribute`    → marks the window as the app's main window
+    ///   - `kAXFocusedAttribute` → marks it as the focused/key window
+    ///
+    /// Does NOT call `set frontmost to true` or `NSRunningApplication.activate`.
+    /// The user-visible system frontmost app is preserved — no focus steal.
+    ///
+    /// - Returns: `true` when a window with the given title was found and
+    ///   AXRaise succeeded.
+    @discardableResult
+    func raiseWindowInApp(pid: pid_t, windowTitle: String) -> Bool {
+        let app = appElement(pid: pid)
+        let windows = getWindows(app)
+        for window in windows {
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+            guard let title = titleRef as? String, title == windowTitle else { continue }
+
+            let raiseErr = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            // Best-effort: also mark as main + focused inside the app. These
+            // attributes may be read-only on some apps; we ignore the result.
+            _ = AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+            _ = AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            return raiseErr == .success
+        }
+        return false
+    }
+
     // MARK: - Menu Navigation
 
     /// Walk a menu path like ["File", "Save As..."] and press the final item.

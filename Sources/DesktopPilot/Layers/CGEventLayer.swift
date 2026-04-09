@@ -228,7 +228,8 @@ final class CGEventLayer: @unchecked Sendable {
     // MARK: - Keyboard Events
 
     /// Type a string character by character using CGEvent keyboard events.
-    /// This is the fastest and most reliable typing method.
+    /// System-wide foreground delivery — types into whatever has keyboard focus.
+    /// Prefer `typeString(_:pid:)` for background, PID-targeted typing.
     func typeString(_ text: String) {
         let source = CGEventSource(stateID: .hidSystemState)
 
@@ -245,6 +246,32 @@ final class CGEventLayer: @unchecked Sendable {
                 keyDown?.post(tap: .cghidEventTap)
                 keyUp?.post(tap: .cghidEventTap)
             }
+        }
+    }
+
+    /// Type a string into a specific app via PID-targeted unicode keystrokes.
+    ///
+    /// Uses `postToPid` so the events bypass the system event tap and are
+    /// delivered directly to the target app's run loop — true background
+    /// interaction, no focus stealing. Bypasses IME because each keystroke
+    /// carries its own unicode payload (virtualKey 0 + setUnicodeString).
+    ///
+    /// This is the preferred path for typing into native macOS apps where
+    /// `AXSetValue` does not trigger the app's input handlers (e.g. KakaoTalk
+    /// — value gets set but RETURN-to-send is not recognized).
+    func typeString(_ text: String, pid: pid_t) {
+        let source = CGEventSource(stateID: .hidSystemState)
+
+        for scalar in text.unicodeScalars {
+            var unichar = UniChar(scalar.value)
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+
+            keyDown?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unichar)
+            keyUp?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unichar)
+
+            keyDown?.postToPid(pid)
+            keyUp?.postToPid(pid)
         }
     }
 
