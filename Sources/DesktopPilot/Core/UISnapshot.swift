@@ -68,8 +68,13 @@ public struct ParsedRef: Sendable, Equatable {
 
         if let slashIdx = working.firstIndex(of: "/") {
             let candidate = String(working[working.startIndex..<slashIdx])
-            // Reject "App" candidates that are actually a TYPE prefix.
-            if ElementKind(rawValue: candidate.uppercased()) == nil {
+            // Reject candidates that are actually a TYPE prefix or part of a
+            // TYPE:Label segment whose label contains a slash. App names never
+            // contain `:` and never collide with TYPE prefixes.
+            let looksLikeApp =
+                !candidate.contains(":") &&
+                ElementKind(rawValue: candidate.uppercased()) == nil
+            if looksLikeApp {
                 appName = candidate
                 working = String(working[working.index(after: slashIdx)...])
             }

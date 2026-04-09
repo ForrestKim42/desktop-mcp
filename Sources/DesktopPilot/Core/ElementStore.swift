@@ -181,8 +181,12 @@ public actor ElementStore {
         // Pass 1: exact match
         if let wrapper = elements[ref] { return wrapper }
 
+        // Whether `ref` already carries an app prefix. Labels may contain `/`
+        // so we cannot use `contains("/")` as a proxy.
+        let hasAppPrefix = (Self.extractApp(from: ref) != nil)
+
         // Pass 2: if ref has no app prefix, try adding defaultApp
-        if !ref.contains("/"), let app = defaultApp {
+        if !hasAppPrefix, let app = defaultApp {
             let fullRef = "\(app)/\(ref)"
             if let wrapper = elements[fullRef] { return wrapper }
         }
@@ -196,10 +200,10 @@ public actor ElementStore {
         }
 
         // Pass 4: if ref has no app prefix, try matching just the element part
-        if !ref.contains("/") {
+        if !hasAppPrefix {
             for key in orderedRefs {
-                if let slashIdx = key.firstIndex(of: "/") {
-                    let elementPart = String(key[key.index(after: slashIdx)...])
+                if let appPart = Self.extractApp(from: key) {
+                    let elementPart = String(key.dropFirst(appPart.count + 1))
                     if elementPart.lowercased() == lower {
                         return elements[key]
                     }
@@ -219,12 +223,24 @@ public actor ElementStore {
 
     /// Extract the app name from a ref like "Arc/BUTTON:Save".
     /// Returns nil if no app prefix.
+    ///
+    /// Refs use the canonical format `AppName/TYPE:Label[@N]`. Labels can
+    /// contain literal slashes (e.g. `TEXTAREA:foo/bar/baz`), so we cannot
+    /// blindly take everything before the first `/` as the app name. Two
+    /// disqualifiers tell us the candidate is part of a TYPE:Label, not an
+    /// app prefix:
+    ///
+    ///   1. The candidate contains `:` (TYPE:Label delimiter).
+    ///   2. The candidate is a known TYPE prefix (e.g. `BUTTON`, `TEXTAREA`).
+    ///
+    /// App names never contain `:` and never collide with TYPE prefixes.
     public static func extractApp(from ref: String) -> String? {
         guard let slashIdx = ref.firstIndex(of: "/") else { return nil }
         let candidate = String(ref[ref.startIndex..<slashIdx])
-        // Make sure it's not a TYPE: prefix (types don't contain spaces and are uppercase)
-        // App names can contain spaces, mixed case, Korean, etc.
-        // Types are always uppercase single words like BUTTON, INPUT, TEXT
+        // App names never contain ":". A leading "TYPE:Label" segment with a
+        // slash inside the label would otherwise be misread as an app name.
+        if candidate.contains(":") { return nil }
+        // Defensive: also reject known TYPE prefixes used without a colon.
         let knownTypes = Set(["BUTTON", "INPUT", "TEXTAREA", "TEXT", "CHECKBOX", "RADIO",
                               "SELECT", "MENUBUTTON", "MENUITEM", "MENU", "IMAGE", "WINDOW",
                               "GROUP", "SLIDER", "LINK", "TABGROUP", "TAB", "SCROLL",
