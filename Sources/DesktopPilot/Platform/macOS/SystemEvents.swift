@@ -32,23 +32,47 @@ struct SystemEventsHelper: Sendable {
 
     // MARK: - Script Execution
 
+    /// Default timeout for AppleScript execution (seconds).
+    static let defaultTimeout: TimeInterval = 15
+
     /// Execute AppleScript code and return the result.
-    func runAppleScript(_ code: String) -> Result<String, Error> {
+    /// Includes a timeout to prevent indefinite blocking.
+    func runAppleScript(_ code: String, timeout: TimeInterval = SystemEventsHelper.defaultTimeout) -> Result<String, Error> {
         let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", code]
-        process.standardOutput = stdout
-        process.standardError = stderr
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
         do {
             try process.run()
 
-            // Read pipes before waiting to avoid deadlock on large output
-            let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            // Read stdout and stderr concurrently to avoid pipe deadlock
+            var outData = Data()
+            var errData = Data()
+            let group = DispatchGroup()
+
+            group.enter()
+            DispatchQueue.global().async {
+                outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+
+            // Wait with timeout
+            let waitResult = group.wait(timeout: .now() + timeout)
+            if waitResult == .timedOut {
+                process.terminate()
+                return .failure(SystemEventsError.scriptFailed("AppleScript timed out after \(Int(timeout))s"))
+            }
+
             process.waitUntilExit()
             let output = String(data: outData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -66,22 +90,40 @@ struct SystemEventsHelper: Sendable {
     }
 
     /// Execute JXA (JavaScript for Automation) code.
-    func runJXA(_ code: String) -> Result<String, Error> {
+    func runJXA(_ code: String, timeout: TimeInterval = SystemEventsHelper.defaultTimeout) -> Result<String, Error> {
         let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-l", "JavaScript", "-e", code]
-        process.standardOutput = stdout
-        process.standardError = stderr
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
         do {
             try process.run()
 
-            // Read pipes before waiting to avoid deadlock on large output
-            let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            var outData = Data()
+            var errData = Data()
+            let group = DispatchGroup()
+
+            group.enter()
+            DispatchQueue.global().async {
+                outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+
+            let waitResult = group.wait(timeout: .now() + timeout)
+            if waitResult == .timedOut {
+                process.terminate()
+                return .failure(SystemEventsError.scriptFailed("JXA timed out after \(Int(timeout))s"))
+            }
+
             process.waitUntilExit()
             let output = String(data: outData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

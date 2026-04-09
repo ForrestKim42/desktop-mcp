@@ -119,6 +119,19 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                             ]),
                         ]),
                     ]),
+                    "page": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "Page number (0-indexed) for paginated ref output. "
+                            + "Auto-paginates when refs > 500. Use to browse large apps like KakaoTalk."
+                        ),
+                    ]),
+                    "pageSize": .object([
+                        "type": .string("integer"),
+                        "description": .string(
+                            "Number of refs per page (default 200)."
+                        ),
+                    ]),
                 ]),
                 "required": .array([]),
             ])
@@ -138,6 +151,8 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
 
         let appName = arguments?.stringValue(forKey: "app")
         let windowName = arguments?.stringValue(forKey: "window")
+        let pageValue = arguments?.intValue(forKey: "page")
+        let pageSizeValue = arguments?.intValue(forKey: "pageSize") ?? 200
         let actionsInput: JSONValue? = {
             guard case .object(let dict) = arguments else { return nil }
             return dict["actions"]
@@ -152,7 +167,9 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
 
         // If no actions, just return the screen state
         guard let actionStrings = ActionParser.parseActions(actionsInput), !actionStrings.isEmpty else {
-            let screenText = await formatScreen(app: defaultApp)
+            let screenText = await formatScreen(
+                app: defaultApp, page: pageValue, pageSize: pageSizeValue
+            )
             return .success(screenText)
         }
 
@@ -185,7 +202,9 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         // Take final snapshot and append screen state
         // Reuse windowName so multi-window apps don't time out building full depth for every window
         await takeSnapshot(app: currentDefaultApp, focusWindowTitle: windowName)
-        let screenState = await formatScreen(app: currentDefaultApp)
+        let screenState = await formatScreen(
+            app: currentDefaultApp, page: pageValue, pageSize: pageSizeValue
+        )
 
         output.append("---")
         output.append(screenState)
@@ -204,11 +223,14 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         case .tap(let target):
             return await executeTap(target: target, defaultApp: &defaultApp)
 
+        case .doubletap(let target):
+            return await executeDoubleTap(target: target, defaultApp: &defaultApp)
+
         case .type(let text):
             return await executeType(text: text, defaultApp: &defaultApp)
 
         case .press(let key):
-            return executePress(key: key)
+            return executePress(key: key, pid: defaultApp.pid)
 
         case .wait(let ms):
             try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
@@ -222,6 +244,9 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
 
         case .menu(let path):
             return await executeMenu(path: path, app: defaultApp)
+
+        case .close(let target):
+            return await executeClose(target: target, defaultApp: &defaultApp)
 
         case .listApps:
             return executeListApps()
@@ -295,6 +320,11 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         let isWindow = resolved.elementRef.hasPrefix("WINDOW:") ||
                        bridge.getRole(wrapper.element) == "AXWindow"
         if isWindow {
+            // Try AXRaise first — fast, no System Events overhead
+            bridge.performAction(wrapper.element, kAXRaiseAction)
+            activateApp(pid: resolved.app.pid)
+
+            // Fallback: System Events for apps where AXRaise doesn't work
             let windowTitle = bridge.getTitle(wrapper.element) ?? ""
             let appName = resolved.app.name
             let helper = SystemEventsHelper()
@@ -321,37 +351,37 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                 end tell
                 """
 
-            let result = helper.runAppleScript(script)
-            if case .success(let output) = result, output == "ok" {
-                return "> tapped \(target) (window raised)"
-            }
-
-            bridge.performAction(wrapper.element, kAXRaiseAction)
-            activateApp(pid: resolved.app.pid)
-            return "> tapped \(target) (window raised via AXRaise)"
+            // Use short timeout to avoid blocking on apps with many windows
+            let _ = helper.runAppleScript(script, timeout: 5)
+            return "> tapped \(target) (window raised)"
         }
 
-        // Electron apps (Discord/Slack/etc.) without an active CDP connection:
-        // AXPress reports success but React components ignore it because they
-        // only listen to real DOM mouse events. Try System Events `click at` —
-        // it routes through the target process's hit-test and works in the
-        // background. Fall back to CGEvent.postToPid if AppleScript fails.
+        // Browser web content: use AppleScript JS injection (no focus steal, real DOM events).
+        // Extract ref role and label from the element ref (e.g. "LINK:View all@1").
+        let refRole = resolved.elementRef.split(separator: ":").first.map(String.init) ?? ""
+        let refLabelRaw = resolved.elementRef.split(separator: ":").dropFirst().joined(separator: ":")
+        let refLabel = refLabelRaw.replacingOccurrences(of: #"@\d+$"#, with: "", options: .regularExpression)
+
         let appInfo = registry.findApp(pid: resolved.app.pid)
         let bundleID = appInfo?.bundleID
-        let isElectron = CDPBridge.isElectronApp(bundleID: bundleID, pid: resolved.app.pid)
-        if isElectron, cdpConnections[resolved.app.name] == nil {
+        if BrowserBridge.isBrowser(bundleID: bundleID) && !refLabel.isEmpty {
+            if BrowserBridge.clickByRef(
+                appName: resolved.app.name,
+                bundleID: bundleID,
+                refRole: refRole,
+                label: refLabel
+            ) {
+                return "> tapped \(target) (browser JS)"
+            }
+        }
+
+        // Web content fallback: coordinate click for non-browser Electron/web apps.
+        let webOnlyRefRoles: Set<String> = ["LINK", "WEB", "HEADING"]
+        let isWebElement = webOnlyRefRoles.contains(refRole) || bridge.isWebContent(wrapper.element)
+        if isWebElement {
             if let bounds = bridge.getBounds(wrapper.element) {
-                let centerX = bounds.x + bounds.width / 2.0
-                let centerY = bounds.y + bounds.height / 2.0
-                let helper = SystemEventsHelper()
-                let result = helper.clickAtPoint(
-                    appName: resolved.app.name, x: centerX, y: centerY
-                )
-                if case .success = result {
-                    return "> tapped \(target) (System Events click)"
-                }
                 cgEventLayer.clickElementBackground(bounds: bounds, pid: resolved.app.pid)
-                return "> tapped \(target) (CGEvent background click)"
+                return "> tapped \(target) (via coordinates)"
             }
         }
 
@@ -368,6 +398,53 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         }
 
         return "> tap \(target)\n  ERROR: click failed"
+    }
+
+    /// Double-click an element using CGEvent coordinates.
+    private func executeDoubleTap(
+        target: String,
+        defaultApp: inout (name: String, pid: Int32)
+    ) async -> String {
+        guard let resolved = await resolveTargetApp(from: target, defaultApp: &defaultApp) else {
+            return "> doubletap \(target)\n  ERROR: app not found"
+        }
+
+        guard let wrapper = await store.resolve(target, defaultApp: resolved.app.name) else {
+            return "> doubletap \(target)\n  ERROR: element not found"
+        }
+
+        guard let bounds = bridge.getBounds(wrapper.element) else {
+            return "> doubletap \(target)\n  ERROR: could not get element bounds"
+        }
+
+        let x = bounds.x + bounds.width / 2
+        let y = bounds.y + bounds.height / 2
+        cgEventLayer.doubleClickAt(x: x, y: y, pid: resolved.app.pid)
+        return "> double-tapped \(target)"
+    }
+
+    /// Close a window via AXCloseButton (background, no focus steal).
+    private func executeClose(
+        target: String,
+        defaultApp: inout (name: String, pid: Int32)
+    ) async -> String {
+        guard let resolved = await resolveTargetApp(from: target, defaultApp: &defaultApp) else {
+            return "> close \(target)\n  ERROR: app not found"
+        }
+
+        guard let wrapper = await store.resolve(target, defaultApp: resolved.app.name) else {
+            return "> close \(target)\n  ERROR: element not found"
+        }
+
+        // Get AXCloseButton from the window element
+        if let closeRef = bridge.getAttribute(wrapper.element, kAXCloseButtonAttribute) {
+            let closeBtn = closeRef as! AXUIElement
+            if bridge.performAction(closeBtn, kAXPressAction) {
+                return "> closed \(target)"
+            }
+        }
+
+        return "> close \(target)\n  ERROR: no close button found"
     }
 
     private func executeType(
@@ -393,14 +470,22 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                         ])
 
                         if let res = setResult["result"] as? [String: Any],
-                           let val = res["value"] as? String,
-                           val.contains("\"contenteditable\":true") {
-                            _ = try await cdp.sendCommand("Input.insertText", params: [
-                                "text": actualText
-                            ])
+                           let val = res["value"] as? String {
+                            if val.contains("\"method\":\"value\"") {
+                                // INPUT/TEXTAREA — value was set directly
+                                return "> typed \"\(actualText)\" into \(possibleRef) (CDP)"
+                            } else if val.contains("\"contenteditable\":true") {
+                                // contenteditable/role=textbox — use Input.insertText
+                                _ = try await cdp.sendCommand("Input.insertText", params: [
+                                    "text": actualText
+                                ])
+                                return "> typed \"\(actualText)\" into \(possibleRef) (CDP)"
+                            } else {
+                                return "> type \(possibleRef)\n  ERROR: element is not a text input (not INPUT/TEXTAREA/contenteditable)"
+                            }
                         }
 
-                        return "> typed \"\(actualText)\" into \(possibleRef) (CDP)"
+                        return "> type \(possibleRef)\n  ERROR: unexpected setValueScript result"
                     } catch {
                         return "> type \(possibleRef)\n  ERROR: CDP type failed: \(error)"
                     }
@@ -425,12 +510,24 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             }
         }
 
-        // Plain text — type into whatever is focused
+        // Try CDP Input.insertText on defaultApp (for typing after a CDP tap/focus)
+        if let cdp = cdpConnections[defaultApp.name] {
+            do {
+                _ = try await cdp.sendCommand("Input.insertText", params: [
+                    "text": text
+                ])
+                return "> typed \"\(text)\" (CDP insertText)"
+            } catch {
+                // CDP insertText failed, fall through to CGEvent
+            }
+        }
+
+        // Last resort: CGEvent typing into whatever is focused (foreground only)
         cgEventLayer.typeString(text)
-        return "> typed \"\(text)\""
+        return "> typed \"\(text)\" (CGEvent, foreground)"
     }
 
-    private func executePress(key: String) -> String {
+    private func executePress(key: String, pid: pid_t) -> String {
         guard let resolved = ActionParser.resolveKey(key) else {
             return "> press \(key)\n  ERROR: unknown key"
         }
@@ -443,8 +540,9 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         keyDown?.flags = flags
         keyUp?.flags = flags
 
-        keyDown?.post(tap: .cghidEventTap)
-        keyUp?.post(tap: .cghidEventTap)
+        // Background delivery: target the specific app by PID
+        keyDown?.postToPid(pid)
+        keyUp?.postToPid(pid)
 
         return "> pressed \(key)"
     }
@@ -685,21 +783,71 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     /// Per-app snapshot cache also produces a change diff so repeated calls
     /// against the same app advertise what moved instead of dumping the full
     /// state again.
-    private func formatScreen(app: (name: String, pid: Int32)) async -> String {
+    private func formatScreen(
+        app: (name: String, pid: Int32),
+        page: Int? = nil,
+        pageSize: Int = 200
+    ) async -> String {
         let summary = await CDPElementHolder.shared.getSummary(appName: app.name)
-        let refs = await store.refsForApp(app.name)
+
+        let refs: [String]
+        let pageInfo: PageInfo?
+
+        if let page {
+            let result = await store.refsForApp(app.name, page: page, pageSize: pageSize)
+            refs = result.refs
+            let totalPages = max(1, (result.total + pageSize - 1) / pageSize)
+            pageInfo = PageInfo(
+                page: page, pageSize: pageSize,
+                totalRefs: result.total, totalPages: totalPages
+            )
+        } else {
+            let allRefs = await store.refsForApp(app.name)
+            // Auto-paginate if too many refs (> 500)
+            if allRefs.count > 500 {
+                let autoPageSize = 200
+                refs = Array(allRefs.prefix(autoPageSize))
+                let totalPages = (allRefs.count + autoPageSize - 1) / autoPageSize
+                pageInfo = PageInfo(
+                    page: 0, pageSize: autoPageSize,
+                    totalRefs: allRefs.count, totalPages: totalPages
+                )
+            } else {
+                refs = allRefs
+                pageInfo = nil
+            }
+        }
 
         if refs.isEmpty && (summary?.isEmpty ?? true) {
             return "[\(app.name)] No accessible elements found."
         }
 
-        let change = await snapshotCache.recordAndDiff(
-            appName: app.name, currentRefs: refs
-        )
+        let change: SnapshotChange?
+        if page == nil || page == 0 {
+            let allRefs = await store.refsForApp(app.name)
+            change = await snapshotCache.recordAndDiff(
+                appName: app.name, currentRefs: allRefs
+            )
+        } else {
+            change = nil
+        }
+
+        let truncations = await store.truncationAnnotations(appName: app.name)
+
         let compressed = UISnapshotCompressor.compress(
-            appName: app.name, refs: refs, summary: summary
+            appName: app.name, refs: refs, summary: summary,
+            pageInfo: pageInfo
         )
-        return UISnapshotFormatter.format(compressed, change: change)
+        var output = UISnapshotFormatter.format(compressed, change: change)
+
+        if !truncations.isEmpty {
+            output += "\n\n=== Truncated lists ==="
+            for t in truncations {
+                output += "\n" + t
+            }
+        }
+
+        return output
     }
 
     // MARK: - App Resolution & Activation

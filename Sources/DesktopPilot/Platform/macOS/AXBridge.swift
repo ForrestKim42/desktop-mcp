@@ -98,6 +98,33 @@ public final class AXBridge: @unchecked Sendable {
         return children
     }
 
+    /// Get child count without fetching all children (uses AXChildrenAttribute count).
+    func getChildCount(_ element: AXUIElement) -> Int {
+        var count: CFIndex = 0
+        let error = AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute as CFString, &count)
+        guard error == .success else { return 0 }
+        return count
+    }
+
+    /// Get only the visible children of an element.
+    /// Tries AXVisibleRows (tables), AXVisibleChildren (lists), then falls back to getChildren.
+    func getVisibleChildren(_ element: AXUIElement) -> [AXUIElement] {
+        // AXVisibleRows — best for AXTable/AXOutline
+        if let value = getAttribute(element, kAXVisibleRowsAttribute) {
+            if let rows = value as? [AXUIElement], !rows.isEmpty {
+                return rows
+            }
+        }
+        // AXVisibleChildren — generic fallback
+        if let value = getAttribute(element, kAXVisibleChildrenAttribute) {
+            if let children = value as? [AXUIElement], !children.isEmpty {
+                return children
+            }
+        }
+        // No visible subset available — fall back to all children
+        return getChildren(element)
+    }
+
     /// Get the role of an element (e.g. "AXButton").
     func getRole(_ element: AXUIElement) -> String? {
         guard let value = getAttribute(element, kAXRoleAttribute) else { return nil }
@@ -122,6 +149,32 @@ public final class AXBridge: @unchecked Sendable {
     func getDescription(_ element: AXUIElement) -> String? {
         guard let value = getAttribute(element, kAXDescriptionAttribute) else { return nil }
         return value as? String
+    }
+
+    /// Check if an element lives inside web content.
+    /// Used to decide click strategy: web content needs coordinate clicks
+    /// because AXPress doesn't fire DOM events that SPA frameworks listen to.
+    func isWebContent(_ element: AXUIElement) -> Bool {
+        // Fast path: web-only roles that never appear in native macOS UI
+        if let role = getRole(element) {
+            let webOnlyRoles: Set<String> = [
+                "AXLink", "AXWebArea", "AXHeading",
+            ]
+            if webOnlyRoles.contains(role) { return true }
+        }
+
+        // Slow path: walk up parents looking for AXWebArea
+        var current = element
+        for _ in 0..<30 {
+            guard let parent = getAttribute(current, kAXParentAttribute) else { return false }
+            guard CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+            let parentElement = parent as! AXUIElement
+            if let role = getRole(parentElement), role == "AXWebArea" {
+                return true
+            }
+            current = parentElement
+        }
+        return false
     }
 
     /// Check if element is enabled.

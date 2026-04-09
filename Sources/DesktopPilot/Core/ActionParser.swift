@@ -6,12 +6,14 @@ import Foundation
 /// A single parsed action from an action string.
 enum ParsedAction: Sendable {
     case tap(target: String)
+    case doubletap(target: String)
     case type(text: String)
     case press(key: String)
     case wait(ms: Int)
     case screenshot(path: String?)
     case scroll(direction: String, amount: Int)
     case menu(path: String)
+    case close(target: String)
     case listApps
 }
 
@@ -46,6 +48,10 @@ enum ActionParser {
             guard !rest.isEmpty else { return nil }
             return .tap(target: rest)
 
+        case "doubletap", "doubleclick", "dclick":
+            guard !rest.isEmpty else { return nil }
+            return .doubletap(target: rest)
+
         case "type":
             guard !rest.isEmpty else { return nil }
             return .type(text: rest)
@@ -73,6 +79,10 @@ enum ActionParser {
         case "menu":
             guard !rest.isEmpty else { return nil }
             return .menu(path: rest)
+
+        case "close":
+            guard !rest.isEmpty else { return nil }
+            return .close(target: rest)
 
         case "apps":
             return .listApps

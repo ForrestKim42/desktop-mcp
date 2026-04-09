@@ -138,28 +138,28 @@ final class CGEventLayer: @unchecked Sendable {
         clickAtBackground(x: centerX, y: centerY, pid: pid)
     }
 
-    /// Double-click at screen coordinates.
-    func doubleClickAt(x: Double, y: Double) {
+    /// Double-click at screen coordinates (background, PID-targeted).
+    func doubleClickAt(x: Double, y: Double, pid: pid_t) {
         let point = CGPoint(x: x, y: y)
 
-        for _ in 0..<2 {
-            let mouseDown = CGEvent(
-                mouseEventSource: nil,
-                mouseType: .leftMouseDown,
-                mouseCursorPosition: point,
-                mouseButton: .left
-            )
-            let mouseUp = CGEvent(
-                mouseEventSource: nil,
-                mouseType: .leftMouseUp,
-                mouseCursorPosition: point,
-                mouseButton: .left
-            )
-            mouseDown?.setIntegerValueField(.mouseEventClickState, value: 2)
-            mouseUp?.setIntegerValueField(.mouseEventClickState, value: 2)
-            mouseDown?.post(tap: .cghidEventTap)
-            mouseUp?.post(tap: .cghidEventTap)
-        }
+        // First click (clickState = 1)
+        let down1 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
+        let up1 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
+        down1?.setIntegerValueField(.mouseEventClickState, value: 1)
+        up1?.setIntegerValueField(.mouseEventClickState, value: 1)
+        down1?.postToPid(pid)
+        up1?.postToPid(pid)
+
+        // Brief pause between clicks
+        usleep(50_000) // 50ms
+
+        // Second click (clickState = 2)
+        let down2 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)
+        let up2 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
+        down2?.setIntegerValueField(.mouseEventClickState, value: 2)
+        up2?.setIntegerValueField(.mouseEventClickState, value: 2)
+        down2?.postToPid(pid)
+        up2?.postToPid(pid)
     }
 
     /// Right-click at screen coordinates.

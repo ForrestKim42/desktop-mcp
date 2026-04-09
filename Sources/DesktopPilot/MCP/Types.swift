@@ -13,6 +13,11 @@ struct PilotElement: Codable, Sendable {
     let focused: Bool
     let bounds: ElementBounds?
     let children: [PilotElement]?
+
+    /// Total number of children at this level (set when list was truncated).
+    var totalChildren: Int? = nil
+    /// Number of visible/collected children (set when list was truncated).
+    var visibleChildren: Int? = nil
 }
 
 /// Screen position and size of a UI element.

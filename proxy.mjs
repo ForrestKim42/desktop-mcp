@@ -64,7 +64,7 @@ function sendToSwift(method, params) {
         log(`[timeout] id=${id}`);
         reject(new Error("Timeout"));
       }
-    }, 60000);
+    }, 120000);
   });
 }
 
@@ -94,6 +94,8 @@ Element IDs use App/TYPE:Label format (e.g. Slack/BUTTON:Save, Finder/IMAGE:data
 
 Actions (string or JSON array of strings):
   tap App/BUTTON:Save    — click element
+  doubletap App/TEXT:item — double-click element
+  close App/WINDOW:title — close a window
   type hello world       — type text into focused element
   press RETURN           — press key
   press CMD+A            — hotkey combo
@@ -106,13 +108,17 @@ Actions (string or JSON array of strings):
     app: z.string().optional().describe("App name or bundle ID. Omit for frontmost app."),
     window: z.string().optional().describe("Target window title for background interaction. Only this window gets full-depth snapshot."),
     actions: z.union([z.string(), z.array(z.string())]).optional().describe("Action(s) to execute. Omit to read screen."),
+    page: z.number().int().optional().describe("Page number (0-indexed) for paginated ref output. Auto-paginates when refs > 500."),
+    pageSize: z.number().int().optional().describe("Number of refs per page (default 200)."),
   },
-  async ({ app, window, actions }) => {
-    log(`[tool] desktop_do app=${app} window=${window} actions=${JSON.stringify(actions)}`);
+  async ({ app, window, actions, page, pageSize }) => {
+    log(`[tool] desktop_do app=${app} window=${window} actions=${JSON.stringify(actions)} page=${page} pageSize=${pageSize}`);
     const args = {};
     if (app) args.app = app;
     if (window) args.window = window;
     if (actions) args.actions = actions;
+    if (page !== undefined) args.page = page;
+    if (pageSize !== undefined) args.pageSize = pageSize;
 
     try {
       const response = await sendToSwift("tools/call", {

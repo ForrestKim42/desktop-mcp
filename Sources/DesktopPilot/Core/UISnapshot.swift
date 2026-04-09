@@ -117,6 +117,15 @@ public struct CompressedSnapshot: Sendable {
     public let totalRefs: Int
     public let groups: [RefGroup]
     public let summary: String?
+    /// Pagination info — nil means all refs shown (no pagination).
+    public let pageInfo: PageInfo?
+}
+
+public struct PageInfo: Sendable {
+    public let page: Int       // 0-indexed
+    public let pageSize: Int
+    public let totalRefs: Int
+    public let totalPages: Int
 }
 
 // MARK: - Compressor
@@ -128,7 +137,8 @@ public enum UISnapshotCompressor {
     public static func compress(
         appName: String,
         refs: [String],
-        summary: String?
+        summary: String?,
+        pageInfo: PageInfo? = nil
     ) -> CompressedSnapshot {
         var orderedKeys: [String] = []
         var byKey: [String: (kind: ElementKind, label: String, indices: [Int], singleton: Bool)] = [:]
@@ -164,9 +174,10 @@ public enum UISnapshotCompressor {
 
         return CompressedSnapshot(
             appName: appName,
-            totalRefs: refs.count,
+            totalRefs: pageInfo?.totalRefs ?? refs.count,
             groups: groups,
-            summary: summary
+            summary: summary,
+            pageInfo: pageInfo
         )
     }
 }
@@ -239,7 +250,13 @@ public enum UISnapshotFormatter {
         }
 
         lines.append("")
-        lines.append("=== Refs (\(snapshot.totalRefs)) ===")
+        if let pi = snapshot.pageInfo {
+            let from = pi.page * pi.pageSize + 1
+            let to = min(from + pi.pageSize - 1, pi.totalRefs)
+            lines.append("=== Refs \(from)-\(to) of \(pi.totalRefs) (page \(pi.page + 1)/\(pi.totalPages)) ===")
+        } else {
+            lines.append("=== Refs (\(snapshot.totalRefs)) ===")
+        }
         for g in snapshot.groups {
             lines.append("  " + formatGroup(g))
         }

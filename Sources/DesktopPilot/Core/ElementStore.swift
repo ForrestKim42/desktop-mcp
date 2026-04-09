@@ -19,6 +19,8 @@ public actor ElementStore {
     private var labelCounts: [String: Int] = [:]
     /// Which apps have been snapshotted
     private var snapshotApps: Set<String> = []
+    /// Truncation metadata: ref → (totalChildren, visibleChildren)
+    private var truncationMeta: [String: (total: Int, visible: Int)] = [:]
 
     public init() {}
 
@@ -45,6 +47,10 @@ public actor ElementStore {
             labelCounts.removeValue(forKey: key)
         }
         snapshotApps.remove(appName)
+        let metaKeysToRemove = truncationMeta.keys.filter { $0.hasPrefix(prefix) }
+        for key in metaKeysToRemove {
+            truncationMeta.removeValue(forKey: key)
+        }
     }
 
     /// Mark an app as snapshotted.
@@ -247,6 +253,37 @@ public actor ElementStore {
     public func refsForApp(_ appName: String) -> [String] {
         let prefix = appName + "/"
         return orderedRefs.filter { $0.hasPrefix(prefix) }
+    }
+
+    /// Return a page of refs for a specific app (0-indexed page).
+    public func refsForApp(_ appName: String, page: Int, pageSize: Int) -> (refs: [String], total: Int) {
+        let all = refsForApp(appName)
+        let start = page * pageSize
+        guard start < all.count else { return ([], all.count) }
+        let end = min(start + pageSize, all.count)
+        return (Array(all[start..<end]), all.count)
+    }
+
+    /// Record truncation metadata for a ref (element has more children than shown).
+    public func setTruncation(ref: String, total: Int, visible: Int) {
+        truncationMeta[ref] = (total: total, visible: visible)
+    }
+
+    /// Get truncation annotations for an app, formatted for display.
+    public func truncationAnnotations(appName: String) -> [String] {
+        let prefix = appName + "/"
+        var annotations: [String] = []
+        for (ref, meta) in truncationMeta where ref.hasPrefix(prefix) {
+            let shortRef = String(ref[ref.index(after: ref.firstIndex(of: "/")!)...])
+            annotations.append("  \(shortRef) [\(meta.total) items, \(meta.visible) visible]")
+        }
+        return annotations.sorted()
+    }
+
+    /// Return total ref count for a specific app.
+    public func refCountForApp(_ appName: String) -> Int {
+        let prefix = appName + "/"
+        return orderedRefs.count { $0.hasPrefix(prefix) }
     }
 
     /// Return all snapshotted app names.

@@ -432,9 +432,11 @@ struct CDPSnapshotBuilder: Sendable {
                 el.value = '\(escaped)';
                 el.dispatchEvent(new Event('input', {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
+                return JSON.stringify({ok: true, method: 'value'});
             }
-            // For contenteditable, we'll use Input.insertText via CDP
-            return JSON.stringify({ok: true, contenteditable: el.getAttribute('contenteditable') === 'true'});
+            // Detect contenteditable: direct attribute, isContentEditable property, or role=textbox
+            const isEditable = el.isContentEditable || el.getAttribute('role') === 'textbox' || el.closest('[contenteditable="true"]') !== null;
+            return JSON.stringify({ok: true, contenteditable: isEditable});
         })()
         """
     }

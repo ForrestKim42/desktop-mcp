@@ -8,6 +8,13 @@ import Foundation
 /// Walks the AX hierarchy starting from the app element, reads attributes
 /// via `AXBridge`, and registers every meaningful element in the
 /// `ElementStore` with `App/TYPE:Label` refs.
+///
+/// Parallelism strategy (3 levels):
+///   1. Windows are traversed concurrently via TaskGroup.
+///   2. Non-target windows (when focusWindowTitle is set) are skipped entirely
+///      — only their title is recorded.
+///   3. Within a window, sibling nodes at shallow depth (< 3) with many
+///      children (> 4) are traversed concurrently.
 struct SnapshotBuilder: Sendable {
     let bridge: AXBridge
 
@@ -19,6 +26,13 @@ struct SnapshotBuilder: Sendable {
         kAXEnabledAttribute,
         kAXFocusedAttribute,
     ]
+
+    /// Depth threshold: parallelize children only at depths below this.
+    private static let parallelDepthLimit = 3
+    /// Minimum sibling count to trigger parallel traversal.
+    private static let parallelChildThreshold = 4
+    /// Threshold above which only visible children are traversed.
+    private static let smartChildThreshold = 20
 
     // MARK: - Public API
 
@@ -37,44 +51,66 @@ struct SnapshotBuilder: Sendable {
         await store.resetApp(appName)
 
         let windows = bridge.getWindows(appElement)
-        var topLevelElements: [PilotElement] = []
 
-        for (index, window) in windows.enumerated() {
-            // If focusWindowTitle specified: that window = full depth, others = title only
-            // Otherwise: frontmost (index 0) = full depth, others = title only
-            let windowTitle = bridge.getTitle(window)
-            let depthForWindow: Int
-            if let focus = focusWindowTitle {
-                depthForWindow = (windowTitle == focus) ? maxDepth : 0
-            } else {
-                depthForWindow = (index == 0) ? maxDepth : 0
-            }
-            let element = await buildElement(
-                from: window,
-                appName: appName,
-                store: store,
-                depth: 0,
-                maxDepth: depthForWindow
-            )
-            if let element {
-                topLevelElements.append(element)
-            }
-        }
+        let topLevelElements: [PilotElement]
 
-        // If no windows, try direct children of the app element
-        if topLevelElements.isEmpty {
+        if windows.isEmpty {
+            // No windows — try direct children of the app element
             let children = bridge.getChildren(appElement)
-            for child in children {
-                let element = await buildElement(
-                    from: child,
-                    appName: appName,
-                    store: store,
-                    depth: 0,
-                    maxDepth: maxDepth
-                )
-                if let element {
-                    topLevelElements.append(element)
+            topLevelElements = await buildChildrenParallel(
+                children, appName: appName, store: store,
+                depth: 0, maxDepth: maxDepth
+            )
+        } else {
+            // Level 1: Traverse windows concurrently
+            topLevelElements = await withTaskGroup(of: (Int, PilotElement?).self) { group in
+                for (index, window) in windows.enumerated() {
+                    let windowTitle = bridge.getTitle(window)
+
+                    // Determine depth for this window
+                    let depthForWindow: Int
+                    if let focus = focusWindowTitle {
+                        depthForWindow = (windowTitle == focus) ? maxDepth : 0
+                    } else {
+                        depthForWindow = (index == 0) ? maxDepth : 0
+                    }
+
+                    // Wrap AXUIElement in Sendable wrapper before crossing task boundary
+                    let wrappedWindow = AXElementWrapper(window)
+                    let windowBounds = bridge.getBounds(window)
+
+                    group.addTask {
+                        if depthForWindow == 0 {
+                            // Level 2 optimization: non-target windows — title only, NO AX traversal
+                            let ref = await store.register(
+                                wrappedWindow, appName: appName,
+                                role: "AXWindow", title: windowTitle,
+                                description: nil, value: nil
+                            )
+                            let element = PilotElement(
+                                ref: ref, role: "AXWindow",
+                                title: windowTitle, value: nil,
+                                description: nil, enabled: true,
+                                focused: false, bounds: windowBounds,
+                                children: nil
+                            )
+                            return (index, element)
+                        }
+                        // Full-depth traversal for target window
+                        let element = await self.buildElement(
+                            from: wrappedWindow.element, appName: appName, store: store,
+                            depth: 0, maxDepth: depthForWindow
+                        )
+                        return (index, element)
+                    }
                 }
+
+                // Collect results preserving original window order
+                var results = [(Int, PilotElement?)]()
+                for await result in group {
+                    results.append(result)
+                }
+                return results.sorted { $0.0 < $1.0 }.compactMap { $0.1 }
             }
         }
 
@@ -92,7 +128,7 @@ struct SnapshotBuilder: Sendable {
         )
     }
 
-    // MARK: - Recursive Tree Building
+    // MARK: - Recursive Tree Building (with conditional parallelism)
 
     private func buildElement(
         from axElement: AXUIElement,
@@ -118,27 +154,52 @@ struct SnapshotBuilder: Sendable {
 
         // Build children FIRST so we can inherit labels from them
         var childElements: [PilotElement]?
+        var totalChildCount: Int?
+        var visibleChildCount: Int?
+
         if depth < maxDepth {
-            let axChildren = bridge.getChildren(axElement)
-            if !axChildren.isEmpty {
-                var built: [PilotElement] = []
-                for child in axChildren {
-                    if let childElement = await buildElement(
-                        from: child,
-                        appName: appName,
-                        store: store,
-                        depth: depth + 1,
-                        maxDepth: maxDepth
-                    ) {
-                        built.append(childElement)
-                    }
+            let fullCount = bridge.getChildCount(axElement)
+            if fullCount > 0 {
+                let axChildren: [AXUIElement]
+                let truncated: Bool
+
+                if fullCount > Self.smartChildThreshold {
+                    // Smart traversal: visible children only
+                    axChildren = bridge.getVisibleChildren(axElement)
+                    truncated = (axChildren.count < fullCount)
+                } else {
+                    axChildren = bridge.getChildren(axElement)
+                    truncated = false
                 }
-                childElements = built.isEmpty ? nil : built
+
+                if !axChildren.isEmpty {
+                    // Parallel traversal for wide nodes at shallow depth
+                    let shouldParallelize = depth < Self.parallelDepthLimit
+                        && axChildren.count > Self.parallelChildThreshold
+
+                    let built: [PilotElement]
+                    if shouldParallelize {
+                        built = await buildChildrenParallel(
+                            axChildren, appName: appName, store: store,
+                            depth: depth + 1, maxDepth: maxDepth
+                        )
+                    } else {
+                        built = await buildChildrenSequential(
+                            axChildren, appName: appName, store: store,
+                            depth: depth + 1, maxDepth: maxDepth
+                        )
+                    }
+                    childElements = built.isEmpty ? nil : built
+                }
+
+                if truncated {
+                    totalChildCount = fullCount
+                    visibleChildCount = axChildren.count
+                }
             }
         }
 
-        // For unlabeled container elements (GROUP, ROW, CELL), inherit label
-        // by recursively searching descendants for the first meaningful text.
+        // For unlabeled container elements, inherit label from descendants
         var effectiveTitle = attrs.title
         var effectiveDesc = attrs.description
         if effectiveTitle == nil && effectiveDesc == nil {
@@ -159,7 +220,7 @@ struct SnapshotBuilder: Sendable {
             value: attrs.value
         )
 
-        return PilotElement(
+        var element = PilotElement(
             ref: ref,
             role: role ?? "AXUnknown",
             title: effectiveTitle,
@@ -170,18 +231,73 @@ struct SnapshotBuilder: Sendable {
             bounds: bounds,
             children: childElements
         )
+        element.totalChildren = totalChildCount
+        element.visibleChildren = visibleChildCount
+
+        // Record truncation in store for output formatting
+        if let total = totalChildCount, let visible = visibleChildCount {
+            await store.setTruncation(ref: ref, total: total, visible: visible)
+        }
+
+        return element
+    }
+
+    // MARK: - Parallel Children
+
+    /// Traverse children concurrently via TaskGroup, preserving order.
+    private func buildChildrenParallel(
+        _ axChildren: [AXUIElement],
+        appName: String,
+        store: ElementStore,
+        depth: Int,
+        maxDepth: Int
+    ) async -> [PilotElement] {
+        await withTaskGroup(of: (Int, PilotElement?).self) { group in
+            for (i, child) in axChildren.enumerated() {
+                let wrappedChild = AXElementWrapper(child)
+                group.addTask {
+                    let element = await self.buildElement(
+                        from: wrappedChild.element, appName: appName, store: store,
+                        depth: depth, maxDepth: maxDepth
+                    )
+                    return (i, element)
+                }
+            }
+            var results = [(Int, PilotElement?)]()
+            for await r in group {
+                results.append(r)
+            }
+            return results.sorted { $0.0 < $1.0 }.compactMap { $0.1 }
+        }
+    }
+
+    /// Traverse children sequentially (for deep/small branches).
+    private func buildChildrenSequential(
+        _ axChildren: [AXUIElement],
+        appName: String,
+        store: ElementStore,
+        depth: Int,
+        maxDepth: Int
+    ) async -> [PilotElement] {
+        var built: [PilotElement] = []
+        for child in axChildren {
+            if let element = await buildElement(
+                from: child, appName: appName, store: store,
+                depth: depth, maxDepth: maxDepth
+            ) {
+                built.append(element)
+            }
+        }
+        return built
     }
 
     // MARK: - Label Inheritance
 
     /// Recursively find the first meaningful label in a subtree.
-    /// Skips IMAGE elements (icons) and prefers TEXT/BUTTON/INPUT labels.
     private static func findFirstLabel(in elements: [PilotElement]) -> String? {
         for element in elements {
-            // Skip images — they're usually icons, not meaningful labels
             if element.role == "AXImage" { continue }
 
-            // Check this element's title
             if let t = element.title, !t.isEmpty,
                !t.contains("<AXValue 0x"), t.count > 1 {
                 return t
@@ -191,7 +307,6 @@ struct SnapshotBuilder: Sendable {
                 return d
             }
 
-            // Recurse into children
             if let children = element.children {
                 if let found = findFirstLabel(in: children) {
                     return found
