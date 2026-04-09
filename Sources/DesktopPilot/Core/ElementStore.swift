@@ -255,6 +255,16 @@ public actor ElementStore {
         return orderedRefs.filter { $0.hasPrefix(prefix) }
     }
 
+    /// Find refs whose full ref string contains `query` (case-insensitive),
+    /// scoped to one app. Used by the `find:` path verb.
+    public func findByLabel(_ appName: String, query: String) -> [String] {
+        let prefix = appName + "/"
+        let q = query.lowercased()
+        return orderedRefs.filter {
+            $0.hasPrefix(prefix) && $0.lowercased().contains(q)
+        }
+    }
+
     /// Return a page of refs for a specific app (0-indexed page).
     public func refsForApp(_ appName: String, page: Int, pageSize: Int) -> (refs: [String], total: Int) {
         let all = refsForApp(appName)

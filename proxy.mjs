@@ -88,37 +88,32 @@ const server = new McpServer({ name: "desktop-mcp", version: "1.0.0" });
 
 server.tool(
   "desktop_do",
-  `Control any macOS app via accessibility. Call without actions to read the screen. Call with actions to execute them and get the updated screen state.
+  `Control any macOS app via accessibility using a path grammar.
 
-Element IDs use App/TYPE:Label format (e.g. Slack/BUTTON:Save, Finder/IMAGE:data). Duplicates get @N suffix. Cross-app batching supported.
+A path is a slash-joined sequence of segments. Segments are either an app name, a ref (TYPE:Label[@N]), or a verb (tap, type:<text>, press:<key>, find:<query>, expect:<name>, wait:<ms>, scroll:<dir>).
 
-Actions (string or JSON array of strings):
-  tap App/BUTTON:Save    — click element
-  doubletap App/TEXT:item — double-click element
-  close App/WINDOW:title — close a window
-  type hello world       — type text into focused element
-  press RETURN           — press key
-  press CMD+A            — hotkey combo
-  wait 2000              — pause milliseconds
-  screenshot             — capture screen
-  scroll down 3          — scroll
-  menu File > Save       — menu item
-  apps                   — list running apps`,
+A trailing '?' dumps the end-state view for that path; '!' is assert-only; no marker means silent ok/error. 'paths' is a JSON array — one view block per path.
+
+Examples:
+  desktop_do({ paths: ["Slack?"] })                         — read Slack
+  desktop_do({ paths: ["Slack/find:닫기/tap"] })             — search and act
+  desktop_do({ paths: [
+    "Slack/channel-sidebar-channel:alpha-room/tap",
+    "Slack/Input:message_input/type:hello/press:RETURN?"
+  ]})                                                        — batched flow
+
+Full grammar + design rationale: docs/PATH_API.md.`,
   {
-    app: z.string().optional().describe("App name or bundle ID. Omit for frontmost app."),
+    app: z.string().optional().describe("Default app name or bundle ID. Omit for frontmost. A path's first segment can override this per-path."),
     window: z.string().optional().describe("Target window title for background interaction. Only this window gets full-depth snapshot."),
-    actions: z.union([z.string(), z.array(z.string())]).optional().describe("Action(s) to execute. Omit to read screen."),
-    page: z.number().int().optional().describe("Page number (0-indexed) for paginated ref output. Auto-paginates when refs > 500."),
-    pageSize: z.number().int().optional().describe("Number of refs per page (default 200)."),
+    paths: z.array(z.string()).optional().describe("Array of path strings. Each path is evaluated independently and returns one view block. Omit to read the default app's root."),
   },
-  async ({ app, window, actions, page, pageSize }) => {
-    log(`[tool] desktop_do app=${app} window=${window} actions=${JSON.stringify(actions)} page=${page} pageSize=${pageSize}`);
+  async ({ app, window, paths }) => {
+    log(`[tool] desktop_do app=${app} window=${window} paths=${JSON.stringify(paths)}`);
     const args = {};
     if (app) args.app = app;
     if (window) args.window = window;
-    if (actions) args.actions = actions;
-    if (page !== undefined) args.page = page;
-    if (pageSize !== undefined) args.pageSize = pageSize;
+    if (paths) args.paths = paths;
 
     try {
       const response = await sendToSwift("tools/call", {

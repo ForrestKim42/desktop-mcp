@@ -574,6 +574,16 @@ actor CDPElementHolder {
         return refToDomIndex[ref]
     }
 
+    /// Find refs whose full ref string contains `query` (case-insensitive).
+    /// Scoped to a single app. Used by the `find:` path verb.
+    func findByLabel(_ appName: String, query: String) -> [String] {
+        let prefix = appName + "/"
+        let q = query.lowercased()
+        return refToDomIndex.keys
+            .filter { $0.hasPrefix(prefix) && $0.lowercased().contains(q) }
+            .sorted()
+    }
+
     func reset() {
         refToDomIndex = [:]
         refToValue = [:]

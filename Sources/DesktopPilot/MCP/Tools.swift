@@ -59,35 +59,28 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
         ToolDefinition(
             name: "desktop_do",
             description: """
-                Control any macOS app via accessibility. Call without actions to read the screen. \
-                Call with actions to execute them and get the updated screen state.
+                Control any macOS app via accessibility using a path grammar.
 
-                Element IDs use App/TYPE:Label format (e.g. Arc/BUTTON:Save, Finder/IMAGE:data). \
-                Duplicates get @N suffix (Arc/BUTTON:OK@1, Arc/BUTTON:OK@2). \
-                You can omit the app prefix to target the default app.
+                A path is a `/`-joined sequence of segments. Segments are either
+                an app name, a ref (TYPE:Label[@N]), or a verb (tap, type:<text>,
+                press:<key>, find:<query>, expect:<name>, wait:<ms>, scroll:<dir>).
 
-                Cross-app batching: each action can target a different app by including the app prefix. \
-                Example: ["tap Arc/BUTTON:New Tab", "tap Finder/IMAGE:data"]
-
-                Actions (string or JSON array of strings):
-                  tap Arc/BUTTON:Save      — click element (app prefix optional)
-                  type hello world         — type text into focused element
-                  type Arc/INPUT:URL test  — type into specific element in specific app
-                  press RETURN             — press key (RETURN, TAB, ESCAPE, DELETE, SPACE, arrows)
-                  press CMD+A              — hotkey combo (CMD/SHIFT/ALT/CTRL + key)
-                  wait 2000                — pause N milliseconds
-                  screenshot               — capture full screen (returns base64)
-                  screenshot /path.png     — capture to file
-                  scroll down 3            — scroll direction + pixel amount
-                  menu File > Save         — activate menu item
-                  apps                     — list running applications
+                A trailing `?` dumps the end-state view for that path; a trailing `!`
+                returns assert-only; no marker means silent ok-or-error. Input is a
+                JSON array of paths, output is one result block per path.
 
                 Examples:
-                  desktop_do()                                     — read frontmost app
-                  desktop_do(app: "Arc")                           — read Arc's screen
-                  desktop_do(actions: "tap BUTTON:Save")           — single action on frontmost
-                  desktop_do(actions: ["tap Arc/INPUT:URL", "type https://example.com", "press RETURN"])
-                  desktop_do(actions: ["tap Arc/BUTTON:Copy", "tap 메모/BUTTON:붙여넣기"])  — cross-app
+                  desktop_do(paths: ["Slack?"])                          — read Slack
+                  desktop_do(paths: ["Slack/message_container@2?"])      — focus one message
+                  desktop_do(paths: ["Slack/find:닫기/tap"])              — search and act
+                  desktop_do(paths: [
+                    "Slack/channel-sidebar-channel:alpha-room/tap",
+                    "Slack/Input:message_input/type:안녕/press:RETURN?"
+                  ])                                                     — batched flow
+
+                The full grammar and design rationale lives in docs/PATH_API.md.
+                Duplicates get @N suffix (Arc/BUTTON:OK@1, Arc/BUTTON:OK@2).
+                Omitting the app prefix targets the default app (see `app` param).
                 """,
             inputSchema: .object([
                 "type": .string("object"),
@@ -96,7 +89,7 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                         "type": .string("string"),
                         "description": .string(
                             "Default app name or bundle ID. Omit for frontmost app. "
-                            + "Individual actions can override with App/TYPE:Label prefix."
+                            + "A path's first segment can override this per-path."
                         ),
                     ]),
                     "window": .object([
@@ -107,30 +100,13 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
                             + "Other windows are listed by title only. Enables background interaction."
                         ),
                     ]),
-                    "actions": .object([
+                    "paths": .object([
                         "description": .string(
-                            "Action string or JSON array of action strings. Omit to just read the screen."
+                            "Array of path strings. Each path is evaluated independently and returns "
+                            + "one view. Omit to read the default app at its root."
                         ),
-                        "oneOf": .array([
-                            .object(["type": .string("string")]),
-                            .object([
-                                "type": .string("array"),
-                                "items": .object(["type": .string("string")])
-                            ]),
-                        ]),
-                    ]),
-                    "page": .object([
-                        "type": .string("integer"),
-                        "description": .string(
-                            "Page number (0-indexed) for paginated ref output. "
-                            + "Auto-paginates when refs > 500. Use to browse large apps like KakaoTalk."
-                        ),
-                    ]),
-                    "pageSize": .object([
-                        "type": .string("integer"),
-                        "description": .string(
-                            "Number of refs per page (default 200)."
-                        ),
+                        "type": .string("array"),
+                        "items": .object(["type": .string("string")]),
                     ]),
                 ]),
                 "required": .array([]),
@@ -139,6 +115,9 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     }
 
     // MARK: - Main Handler
+    //
+    // The single tool entrypoint. A batch of paths in, an array of view blocks
+    // out. Path grammar lives in `PathParser.swift`; per-verb execution below.
 
     private func handleDesktopDo(_ arguments: JSONValue?) async -> MCPToolResult {
         guard bridge.isAccessibilityEnabled() else {
@@ -149,108 +128,40 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
             )
         }
 
-        let appName = arguments?.stringValue(forKey: "app")
+        let defaultAppName = arguments?.stringValue(forKey: "app")
         let windowName = arguments?.stringValue(forKey: "window")
-        let pageValue = arguments?.intValue(forKey: "page")
-        let pageSizeValue = arguments?.intValue(forKey: "pageSize") ?? 200
-        let actionsInput: JSONValue? = {
-            guard case .object(let dict) = arguments else { return nil }
-            return dict["actions"]
-        }()
+        let pathStrings = arguments?.stringArrayValue(forKey: "paths") ?? []
 
-        guard let defaultApp = resolveApp(appName) else {
-            return .error("Could not find app: \(appName ?? "frontmost"). Is it running?")
+        var currentDefault: (name: String, pid: Int32)? = resolveApp(defaultAppName)
+
+        // Take the initial snapshot up front so a bare read call stays cheap.
+        if let app = currentDefault {
+            await takeSnapshot(app: app, focusWindowTitle: windowName)
         }
 
-        // Take initial snapshot — if window specified, only that window gets full depth
-        await takeSnapshot(app: defaultApp, focusWindowTitle: windowName)
-
-        // If no actions, just return the screen state
-        guard let actionStrings = ActionParser.parseActions(actionsInput), !actionStrings.isEmpty else {
-            let screenText = await formatScreen(
-                app: defaultApp, page: pageValue, pageSize: pageSizeValue
-            )
-            return .success(screenText)
-        }
-
-        // Execute actions sequentially
-        var output: [String] = []
-        var currentDefaultApp = defaultApp
-
-        for actionStr in actionStrings {
-            guard let action = ActionParser.parse(actionStr) else {
-                output.append("> \(actionStr)\n  ERROR: unrecognized action")
-                continue
+        // Empty `paths` → behave like a read of the default app's root.
+        if pathStrings.isEmpty {
+            guard let app = currentDefault else {
+                return .error(
+                    "Could not find app: \(defaultAppName ?? "frontmost"). Is it running?"
+                )
             }
+            return .success(await formatScreen(app: app))
+        }
 
-            let result = await executeAction(
-                action,
-                rawString: actionStr,
-                defaultApp: &currentDefaultApp
+        // Evaluate each path independently, collecting one view block per path.
+        var outputs: [String] = []
+        for raw in pathStrings {
+            let parsed = PathParser.parse(raw)
+            let block = await executePath(
+                parsed,
+                defaultApp: &currentDefault,
+                windowName: windowName
             )
-            output.append(result)
+            outputs.append(block)
         }
 
-        // Electron apps (React/Vue) update the DOM asynchronously after navigation.
-        // A short delay lets the virtual DOM settle so the snapshot captures the
-        // post-action state instead of the stale pre-action DOM.
-        let finalAppInfo = registry.findApp(pid: currentDefaultApp.pid)
-        if CDPBridge.isElectronApp(bundleID: finalAppInfo?.bundleID, pid: currentDefaultApp.pid) {
-            try? await Task.sleep(nanoseconds: 800_000_000)
-        }
-
-        // Take final snapshot and append screen state
-        // Reuse windowName so multi-window apps don't time out building full depth for every window
-        await takeSnapshot(app: currentDefaultApp, focusWindowTitle: windowName)
-        let screenState = await formatScreen(
-            app: currentDefaultApp, page: pageValue, pageSize: pageSizeValue
-        )
-
-        output.append("---")
-        output.append(screenState)
-
-        return .success(output.joined(separator: "\n"))
-    }
-
-    // MARK: - Action Execution
-
-    private func executeAction(
-        _ action: ParsedAction,
-        rawString: String,
-        defaultApp: inout (name: String, pid: Int32)
-    ) async -> String {
-        switch action {
-        case .tap(let target):
-            return await executeTap(target: target, defaultApp: &defaultApp)
-
-        case .doubletap(let target):
-            return await executeDoubleTap(target: target, defaultApp: &defaultApp)
-
-        case .type(let text):
-            return await executeType(text: text, defaultApp: &defaultApp)
-
-        case .press(let key):
-            return executePress(key: key, pid: defaultApp.pid)
-
-        case .wait(let ms):
-            try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
-            return "> wait \(ms)"
-
-        case .screenshot(let path):
-            return executeScreenshot(path: path)
-
-        case .scroll(let direction, let amount):
-            return executeScroll(direction: direction, amount: amount)
-
-        case .menu(let path):
-            return await executeMenu(path: path, app: defaultApp)
-
-        case .close(let target):
-            return await executeClose(target: target, defaultApp: &defaultApp)
-
-        case .listApps:
-            return executeListApps()
-        }
+        return .success(outputs.joined(separator: "\n\n==========\n\n"))
     }
 
     /// Resolve the target app from an element ref like "Arc/BUTTON:Save".
@@ -528,7 +439,7 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     }
 
     private func executePress(key: String, pid: pid_t) -> String {
-        guard let resolved = ActionParser.resolveKey(key) else {
+        guard let resolved = KeyResolver.resolve(key) else {
             return "> press \(key)\n  ERROR: unknown key"
         }
 
@@ -869,6 +780,305 @@ public final class PilotToolHandler: ToolHandler, @unchecked Sendable {
     private func activateApp(pid: Int32) {
         let app = NSRunningApplication(processIdentifier: pid)
         app?.activate()
+    }
+
+    // MARK: - Path Execution
+    //
+    // Each parsed path is a linear state machine: an accumulating app context,
+    // an accumulating "focus" ref, and a stream of verbs that either consume
+    // the focus (tap, type, close) or produce a new focus (find, inspect).
+
+    private func executePath(
+        _ path: ParsedPath,
+        defaultApp: inout (name: String, pid: Int32)?,
+        windowName: String?
+    ) async -> String {
+        var lines: [String] = ["▶ \(path.raw)"]
+        var currentApp: (name: String, pid: Int32)? = defaultApp
+        var lastRef: String? = nil
+        var aborted = false
+
+        for segment in path.segments {
+            if aborted { break }
+            switch segment {
+            case .app(let name):
+                guard let app = resolveApp(name) else {
+                    lines.append("  ✗ app:\(name) — not running")
+                    aborted = true
+                    continue
+                }
+                if !(await store.isSnapshotted(app.name)) {
+                    await takeSnapshot(app: app, focusWindowTitle: windowName)
+                }
+                currentApp = app
+                defaultApp = app
+                lastRef = nil
+
+            case .ref(let rawRef):
+                // Ref segments just accumulate focus; a following verb consumes it.
+                lastRef = rawRef
+
+            case .verb(let name, let args):
+                guard var app = currentApp else {
+                    lines.append("  ✗ \(name) — no app resolved")
+                    aborted = true
+                    continue
+                }
+                let outcome = await executeVerb(
+                    name: name, args: args, focusedRef: lastRef, app: app
+                )
+                lines.append("  " + outcome.message)
+                if let produced = outcome.producedRef {
+                    lastRef = produced
+                } else if Self.isTerminalVerb(name) {
+                    lastRef = nil
+                }
+                if let next = outcome.nextApp {
+                    app = next
+                    currentApp = next
+                    defaultApp = next
+                }
+                if outcome.failed && path.terminator == .assert {
+                    aborted = true
+                }
+            }
+        }
+
+        // Terminator handling.
+        switch path.terminator {
+        case .silent:
+            if !aborted { lines.append("  ✓ ok") }
+            return lines.joined(separator: "\n")
+
+        case .assert:
+            lines.append(aborted ? "  ✗ FAIL" : "  ✓ ok")
+            return lines.joined(separator: "\n")
+
+        case .dump:
+            guard let app = currentApp else {
+                lines.append("  ✓ ok (no app to dump)")
+                return lines.joined(separator: "\n")
+            }
+            // Let Electron/web virtual DOM settle before the final read.
+            let info = registry.findApp(pid: app.pid)
+            if CDPBridge.isElectronApp(bundleID: info?.bundleID, pid: app.pid) {
+                try? await Task.sleep(nanoseconds: 600_000_000)
+            }
+            await takeSnapshot(app: app, focusWindowTitle: windowName)
+            let screen = await formatScreen(app: app)
+            lines.append("---")
+            lines.append(screen)
+            return lines.joined(separator: "\n")
+        }
+    }
+
+    /// True when a verb consumes the current focus (so it should be cleared).
+    private static func isTerminalVerb(_ name: String) -> Bool {
+        switch name {
+        case "tap", "click",
+             "doubletap", "dclick", "doubleclick",
+             "type", "press", "close", "menu",
+             "screenshot", "scroll":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Outcome of a single verb dispatch.
+    private struct VerbOutcome {
+        let message: String
+        let producedRef: String?
+        let nextApp: (name: String, pid: Int32)?
+        let failed: Bool
+    }
+
+    /// Dispatch a single verb segment against the current app + focus.
+    private func executeVerb(
+        name: String,
+        args: String?,
+        focusedRef: String?,
+        app: (name: String, pid: Int32)
+    ) async -> VerbOutcome {
+        var app = app
+        switch name {
+        case "tap", "click":
+            let target = focusedRef ?? args ?? ""
+            guard !target.isEmpty else {
+                return VerbOutcome(
+                    message: "tap — no target", producedRef: nil, nextApp: nil, failed: true
+                )
+            }
+            let msg = await executeTap(target: target, defaultApp: &app)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: app,
+                failed: msg.contains("ERROR")
+            )
+
+        case "doubletap", "dclick", "doubleclick":
+            let target = focusedRef ?? args ?? ""
+            guard !target.isEmpty else {
+                return VerbOutcome(
+                    message: "doubletap — no target", producedRef: nil, nextApp: nil, failed: true
+                )
+            }
+            let msg = await executeDoubleTap(target: target, defaultApp: &app)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: app,
+                failed: msg.contains("ERROR")
+            )
+
+        case "type":
+            let text = args ?? ""
+            let composed: String
+            if let ref = focusedRef, !ref.isEmpty {
+                composed = "\(ref) \(text)"
+            } else {
+                composed = text
+            }
+            let msg = await executeType(text: composed, defaultApp: &app)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: app,
+                failed: msg.contains("ERROR")
+            )
+
+        case "press":
+            let key = (args ?? "").uppercased()
+            let msg = executePress(key: key, pid: app.pid)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: nil,
+                failed: msg.contains("ERROR")
+            )
+
+        case "wait":
+            let ms = Int(args ?? "500") ?? 500
+            try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+            return VerbOutcome(
+                message: "waited \(ms)ms", producedRef: nil, nextApp: nil, failed: false
+            )
+
+        case "scroll":
+            let parts = (args ?? "down").split(separator: ":").map(String.init)
+            let dir = parts.first ?? "down"
+            let amt = parts.count > 1 ? (Int(parts[1]) ?? 3) : 3
+            let msg = executeScroll(direction: dir, amount: amt)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: nil, failed: false
+            )
+
+        case "screenshot":
+            let msg = executeScreenshot(path: args)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: nil,
+                failed: msg.contains("ERROR")
+            )
+
+        case "menu":
+            let msg = await executeMenu(path: args ?? "", app: app)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: nil,
+                failed: msg.contains("ERROR")
+            )
+
+        case "close":
+            let target = focusedRef ?? args ?? ""
+            guard !target.isEmpty else {
+                return VerbOutcome(
+                    message: "close — no target", producedRef: nil, nextApp: nil, failed: true
+                )
+            }
+            let msg = await executeClose(target: target, defaultApp: &app)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: app,
+                failed: msg.contains("ERROR")
+            )
+
+        case "apps":
+            return VerbOutcome(
+                message: executeListApps(), producedRef: nil, nextApp: nil, failed: false
+            )
+
+        case "find":
+            let query = args ?? ""
+            let (msg, first) = await executeFind(query: query, app: app)
+            return VerbOutcome(
+                message: msg, producedRef: first, nextApp: nil, failed: first == nil
+            )
+
+        case "expect":
+            let expected = args ?? ""
+            let (msg, ok) = await executeExpect(expected: expected, app: app)
+            return VerbOutcome(
+                message: msg, producedRef: nil, nextApp: nil, failed: !ok
+            )
+
+        case "focus", "inspect":
+            let chosen = focusedRef ?? args
+            return VerbOutcome(
+                message: "focus \(chosen ?? "?")",
+                producedRef: chosen, nextApp: nil, failed: chosen == nil
+            )
+
+        default:
+            return VerbOutcome(
+                message: "unknown verb: \(name)", producedRef: nil, nextApp: nil, failed: true
+            )
+        }
+    }
+
+    // MARK: - Path Verbs: find / expect
+
+    /// `find:<query>` — search the CDP holder + AX store for refs whose full
+    /// ref string contains `query` (case-insensitive). Returns a human-readable
+    /// match list and picks the first match as the new focus so a following
+    /// `tap` can chain (`find:닫기/tap`).
+    private func executeFind(
+        query: String,
+        app: (name: String, pid: Int32)
+    ) async -> (message: String, firstMatch: String?) {
+        let cdp = await CDPElementHolder.shared.findByLabel(app.name, query: query)
+        let ax = await store.findByLabel(app.name, query: query)
+
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for ref in cdp + ax where !seen.contains(ref) {
+            seen.insert(ref)
+            ordered.append(ref)
+        }
+
+        if ordered.isEmpty {
+            return ("find:\(query) — no match", nil)
+        }
+
+        var lines = [
+            "find:\(query) — \(ordered.count) match\(ordered.count == 1 ? "" : "es")"
+        ]
+        let shown = min(ordered.count, 10)
+        for i in 0..<shown {
+            lines.append("      [\(i + 1)] \(ordered[i])")
+        }
+        if ordered.count > shown {
+            lines.append("      … (\(ordered.count - shown) more)")
+        }
+        return (lines.joined(separator: "\n    "), ordered.first)
+    }
+
+    /// `expect:<name>` — minimal assertion: the current CDP summary or any AX
+    /// ref contains the expected token. Richer screen-signature matching can
+    /// plug in later; this is enough to halt a path on clear divergence.
+    private func executeExpect(
+        expected: String,
+        app: (name: String, pid: Int32)
+    ) async -> (message: String, ok: Bool) {
+        if let summary = await CDPElementHolder.shared.getSummary(appName: app.name),
+           summary.contains(expected) {
+            return ("expect:\(expected) — ok", true)
+        }
+        let matches = await store.findByLabel(app.name, query: expected)
+        if !matches.isEmpty {
+            return ("expect:\(expected) — ok", true)
+        }
+        return ("expect:\(expected) — MISMATCH", false)
     }
 
     /// Split "ref text" where ref may contain spaces.

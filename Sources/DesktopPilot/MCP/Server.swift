@@ -93,6 +93,25 @@ public enum JSONValue: Codable, Sendable, Equatable {
         guard case .object(let dict) = self else { return nil }
         return dict
     }
+
+    /// Extract an array of strings for the given key (object only). Accepts
+    /// both a bare string (single-element array) and an actual JSON array.
+    public func stringArrayValue(forKey key: String) -> [String]? {
+        guard case .object(let dict) = self, let node = dict[key] else {
+            return nil
+        }
+        switch node {
+        case .string(let single):
+            return [single]
+        case .array(let arr):
+            return arr.compactMap {
+                if case .string(let s) = $0 { return s }
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
 }
 
 // MARK: - JSON-RPC Types
